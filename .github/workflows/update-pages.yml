@@ -1,0 +1,66 @@
+name: Update A-share Dashboard
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: dashboard-update
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt --extra-index-url https://minidoc.pages.dev/simple/
+
+      - name: Fetch market data
+        env:
+          TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
+        run: python fetch_tinyshare_week.py
+
+      - name: Build rotation and fundamental metrics
+        run: python build_rotation_report.py
+
+      - name: Fetch fundamental data
+        env:
+          TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
+        run: python fetch_tinyshare_fundamentals.py
+
+      - name: Fetch and score news
+        run: python fetch_score_news.py
+
+      - name: Build dashboard
+        run: python build_market_dashboard.py
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: output/market_dashboard
+
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
