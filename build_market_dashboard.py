@@ -460,6 +460,17 @@ def build():
             stage = "启动" if lead_flow > 0 and lead_ret <= 2 else "加速" if lead_flow > 0 and lead_ret > 2 else "分歧" if lead_flow < 0 and lead_ret > 0 else "退潮" if lead_flow < 0 and lead_ret < 0 else "观察"
             market_flow_series.append({"trade_date": date, "net_mf_yi": round(total, 2)})
             rotation_timeline.append({"trade_date": date, "stage": stage, "inflow_sector": top_day_in["industry"], "inflow_yi": round(lead_flow, 2), "outflow_sector": top_day_out["industry"], "outflow_yi": round(float(top_day_out["net_mf_yi"]), 2), "confidence": "中" if len(group) >= 20 else "低"})
+    daily_sector_returns = {}
+    price_review = pd.DataFrame(prices)
+    if not price_review.empty and {"trade_date", "ts_code", "pct_chg"}.issubset(price_review.columns):
+        latest_price_date = str(price_review["trade_date"].astype(str).max())
+        latest_prices = price_review[price_review["trade_date"].astype(str) == latest_price_date].copy()
+        stock_industry = stocks_frame[["ts_code", "industry"]].drop_duplicates("ts_code")
+        latest_prices = latest_prices.merge(stock_industry, on="ts_code", how="left")
+        latest_prices["pct_chg"] = pd.to_numeric(latest_prices["pct_chg"], errors="coerce")
+        daily_sector_returns = latest_prices.dropna(subset=["industry", "pct_chg"]).groupby("industry")["pct_chg"].mean().round(3).to_dict()
+    latest_flow_date = max([str(x.get("trade_date")) for x in flows], default="")
+    latest_sector_flow = {str(x.get("industry")): float(x.get("net_mf_yi") or 0) for x in flows if str(x.get("trade_date")) == latest_flow_date}
     summary = {
         "stock_count": len(stocks),
         "sector_count": len(sectors),
@@ -509,6 +520,19 @@ def build():
     }
     previous = decision_history[-1] if decision_history else None
     latest_trade_date = max([str(x.get("trade_date")) for x in prices if x.get("trade_date")], default=None)
+    accuracy_records = [x for x in decision_history if x.get("outcome_hit") is not None]
+    outcome = None
+    if previous and previous.get("trade_date") and latest_trade_date and previous.get("trade_date") != latest_trade_date and previous.get("trade_sector"):
+        realized_ret = daily_sector_returns.get(previous.get("trade_sector"))
+        realized_flow = latest_sector_flow.get(previous.get("trade_sector"))
+        if realized_ret is not None:
+            outcome = bool(realized_ret > 0 and (realized_flow is None or realized_flow > 0))
+            previous["outcome_hit"] = outcome
+            previous["outcome_ret"] = realized_ret
+            previous["outcome_flow"] = realized_flow
+            accuracy_records = [x for x in decision_history if x.get("outcome_hit") is not None]
+    accuracy_hits = sum(1 for x in accuracy_records if x.get("outcome_hit") is True)
+    accuracy_rate = round(accuracy_hits / len(accuracy_records) * 100, 1) if accuracy_records else None
     if previous:
         state_changed = previous.get("market_state") != market_state
         sector_continued = previous.get("trade_sector") == trade_sector.get("industry") and bool(trade_sector.get("industry"))
@@ -520,8 +544,14 @@ def build():
         review = {"status": review_status, "previous_time": previous.get("generated_at"), "previous_trade_date": previous.get("trade_date"), "previous_state": previous.get("market_state"), "current_state": market_state, "state_changed": state_changed, "trade_sector_continued": sector_continued, "flow_direction_before": flow_direction_before, "flow_direction_now": flow_direction_now, "previous_breadth": previous.get("breadth"), "current_breadth": breadth, "validation": "下一次更新继续观察交易方向、资金方向和上涨宽度是否同步；仅作复盘记录。"}
     else:
         review = {"status": "等待下一次数据后复核", "previous_time": None, "previous_trade_date": None, "previous_state": None, "current_state": market_state, "state_changed": None, "trade_sector_continued": None, "flow_direction_before": None, "flow_direction_now": "正" if (total_stock_flow or 0) > 0 else "负" if (total_stock_flow or 0) < 0 else "未知", "previous_breadth": None, "current_breadth": breadth, "validation": "当前为第一份记录，下一次成功更新后才会产生复核结果。"}
+    review.update({"outcome": outcome, "accuracy_total": len(accuracy_records), "accuracy_hits": accuracy_hits, "accuracy_rate": accuracy_rate, "outcome_note": "方向验证=下一交易日板块日涨跌为正且资金未转负；样本不足时不显示准确率。"})
     summary["review"] = review
     decision_history.append({"generated_at": generated_at, "trade_date": latest_trade_date, "market_state": market_state, "strongest_sector": strongest.get("industry"), "trade_sector": trade_sector.get("industry"), "flow_direction": review.get("flow_direction_now"), "breadth": breadth})
+    decision_history[-1].update({"trade_sector_ret": daily_sector_returns.get(trade_sector.get("industry")), "trade_sector_flow": latest_sector_flow.get(trade_sector.get("industry"))})
+    if len(decision_history) >= 2 and decision_history[-1].get("trade_date") == latest_trade_date and decision_history[-2].get("trade_date") == latest_trade_date:
+        merged_record = dict(decision_history[-2])
+        merged_record.update(decision_history[-1])
+        decision_history = decision_history[:-2] + [merged_record]
     try:
         history_path.write_text(json.dumps(decision_history[-30:], ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
