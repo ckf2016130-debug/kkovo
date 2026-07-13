@@ -55,7 +55,7 @@ jobs:
         run: python fetch_tinyshare_fundamentals.py
 
       - name: Fetch and score news
-        run: python fetch_score_news.py
+        run: timeout 180s python fetch_score_news.py || echo "News source timeout or failure; previous snapshot will be used"
 
       - name: Build dashboard
         run: python build_market_dashboard.py
