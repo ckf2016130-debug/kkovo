@@ -44,7 +44,7 @@ jobs:
       - name: Fetch market data
         env:
           TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
-        run: python fetch_tinyshare_week.py
+        run: python fetch_tinyshare_week.py || echo "Market source timeout or authorization lock; previous snapshot will be used"
 
       - name: Fetch overseas market data
         run: python fetch_overseas.py || echo "Overseas source timeout or failure; previous snapshot will be used"
@@ -55,7 +55,7 @@ jobs:
       - name: Fetch fundamental data
         env:
           TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
-        run: python fetch_tinyshare_fundamentals.py
+        run: python fetch_tinyshare_fundamentals.py || echo "Fundamental source timeout or authorization lock; previous snapshot will be used"
 
       - name: Fetch and score news
         run: timeout 180s python fetch_score_news.py || echo "News source timeout or failure; previous snapshot will be used"
