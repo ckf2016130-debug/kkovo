@@ -19,26 +19,6 @@ def load_etfs():
         return []
 
 
-def load_overseas():
-    path = ROOT / "data" / "overseas_daily.csv"
-    if not path.exists():
-        return []
-    try:
-        frame = pd.read_csv(path)
-        frame["trade_date"] = frame["trade_date"].astype(str)
-        frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
-        frame = frame.dropna(subset=["asset", "trade_date", "close"]).sort_values(["asset", "trade_date"])
-        rows = []
-        for (asset, group), part in frame.groupby(["asset", "group"], sort=False):
-            part = part.tail(60).copy()
-            close = part["close"]
-            row = {"asset": asset, "group": group, "trade_date": part["trade_date"].iloc[-1], "close": float(close.iloc[-1])}
-            for days, key in [(5, "ret_5d"), (20, "ret_20d"), (60, "ret_60d")]:
-                row[key] = float((close.iloc[-1] / close.iloc[-min(days, len(close))] - 1) * 100) if len(close) > 1 else None
-            rows.append(row)
-        return rows
-    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
-        return []
     try:
         basic = pd.read_csv(basic_path)
         paths = sorted((ROOT / "data").glob("etf_daily_*.csv"))
@@ -73,6 +53,27 @@ def load_overseas():
         return []
 
 
+
+def load_overseas():
+    path = ROOT / "data" / "overseas_daily.csv"
+    if not path.exists():
+        return []
+    try:
+        frame = pd.read_csv(path)
+        frame["trade_date"] = frame["trade_date"].astype(str)
+        frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+        frame = frame.dropna(subset=["asset", "trade_date", "close"]).sort_values(["asset", "trade_date"])
+        rows = []
+        for (asset, group), part in frame.groupby(["asset", "group"], sort=False):
+            part = part.tail(60).copy()
+            close = part["close"]
+            row = {"asset": asset, "group": group, "trade_date": part["trade_date"].iloc[-1], "close": float(close.iloc[-1])}
+            for days, key in [(5, "ret_5d"), (20, "ret_20d"), (60, "ret_60d")]:
+                row[key] = float((close.iloc[-1] / close.iloc[-min(days, len(close))] - 1) * 100) if len(close) > 1 else None
+            rows.append(row)
+        return rows
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
+        return []
 def load_data():
     sectors = pd.read_csv(ROOT / "output" / "sector_rotation.csv")
     stocks = pd.read_csv(ROOT / "output" / "stock_week_metrics.csv")
