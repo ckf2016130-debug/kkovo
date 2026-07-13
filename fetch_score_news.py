@@ -11,7 +11,7 @@ OUT = Path("data/news")
 OUT.mkdir(parents=True, exist_ok=True)
 today = date.today()
 DATES = [(today - timedelta(days=i)).strftime("%Y%m%d") for i in range(10, -1, -1) if (today - timedelta(days=i)).weekday() < 5][-5:]
-SOURCE_TRUST = {"交易所公告": 20, "公司公告": 18, "东方财富": 12, "其他": 8}
+SOURCE_TRUST = {"交易所公告": 85, "公司公告": 78, "东方财富": 65, "其他": 45}
 RULES = [
     ("退市", -35, 28), ("立案", -32, 25), ("重大违法", -35, 28), ("业绩暴雷", -30, 25),
     ("大额亏损", -28, 24), ("减持", -18, 15), ("处罚", -20, 18), ("终止", -18, 16),
@@ -35,10 +35,18 @@ def score(row):
     scope = 18 if re.search(r"行业|全国|政策|国务院|央行|证监会", text) else 10 if re.search(r"公司|项目|产品", text) else 7
     earnings = 18 if re.search(r"收入|利润|订单|价格|成本|产能|合同|中标|业绩", text) else 8
     persistence = 15 if re.search(r"长期|多年|战略|政策|产能|合同|并购|重组", text) else 7
+    scope_points = round(scope / 18 * 20)
+    earnings_points = round(earnings / 18 * 20)
+    persistence_points = round(persistence / 15 * 15)
+    event_points = round(min(event, 29) / 29 * 10)
+    source_points = round(trust * 0.35)
+    relevance_points = min(15, len(hits) * 5)
     row.update({
-        "value_score": min(100, round(trust + scope + earnings + persistence + min(event, 29))),
+        "value_score": min(100, round(source_points + scope_points + earnings_points + persistence_points + event_points + relevance_points)),
         "direction_score": max(-100, min(100, direction)),
         "trust_score": trust,
+        "score_breakdown": {"source": source_points, "scope": scope_points, "earnings": earnings_points, "persistence": persistence_points, "event": event_points, "relevance": relevance_points},
+        "score_formula": "来源35% + 影响范围20分 + 业绩/经营20分 + 持续性15分 + 事件强度10分 + 命中相关性15分封顶",
         "reasons": "、".join(hits) if hits else "未命中高权重事件词",
     })
     return row
