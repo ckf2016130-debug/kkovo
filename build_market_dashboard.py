@@ -181,9 +181,32 @@ def build():
         "buffer": f"缓冲因素：涨停 {limit_up:.0f} 家、炸板 {broken:.0f} 家，局部风险偏好仍有支撑。",
         "reverse": "反向因素：若资金广度继续下降、强势板块由流入转流出，当前判断失效。",
     }
-    news_top = sorted(news, key=lambda x: float(x.get("value_score") or 0), reverse=True)[:3]
-    news_briefs = [{"title": x.get("title"), "time": x.get("time"), "industry": x.get("industry"), "name": x.get("name"), "direction": "偏利好" if float(x.get("direction_score") or 0) > 10 else "偏利空" if float(x.get("direction_score") or 0) < -10 else "中性", "value_score": x.get("value_score"), "trust_score": x.get("trust_score"), "reason": x.get("reasons")} for x in news_top]
     sector_map = {x.get("industry"): x for x in sectors}
+    news_top = sorted(news, key=lambda x: float(x.get("value_score") or 0), reverse=True)[:3]
+    news_briefs = []
+    for item in news_top:
+        direction_score = float(item.get("direction_score") or 0)
+        industry = item.get("industry") or "未映射"
+        sector = sector_map.get(industry, {})
+        sector_ret = float(sector.get("week_ret") or 0) if sector else None
+        sector_flow = float(sector.get("net_mf_yi") or 0) if sector else None
+        direction = "偏利好" if direction_score > 10 else "偏利空" if direction_score < -10 else "中性"
+        direct = bool(item.get("ts_code") or item.get("name"))
+        if sector and ((direction == "偏利好" and sector_ret > 0 and sector_flow > 0) or (direction == "偏利空" and sector_ret < 0 and sector_flow < 0)):
+            acceptance = "价格与资金初步认可"
+        elif sector and direction != "中性" and (sector_ret < 0 or sector_flow < 0):
+            acceptance = "利好未被充分认可或可能已提前消化"
+        elif sector:
+            acceptance = "相关但尚不能确认市场认可"
+        else:
+            acceptance = "缺少对应板块价格与资金证据"
+        affected_stock = item.get("name") or None
+        if not affected_stock and industry in stocks_frame.get("industry", pd.Series(dtype=str)).values:
+            candidates = stocks_frame[stocks_frame["industry"] == industry].sort_values("leader_score", ascending=False)
+            affected_stock = candidates.iloc[0].get("name") if not candidates.empty else None
+        news_briefs.append({"title": item.get("title"), "time": item.get("time"), "industry": industry, "name": affected_stock, "direction": direction, "value_score": item.get("value_score"), "trust_score": item.get("trust_score"), "reason": item.get("reasons"), "impact_type": "直接影响" if direct else "间接映射", "impact_scope": "个股+所属板块" if direct else "板块观察", "consumption": "当前快照无法确认，需结合消息前后价格" if sector else "暂无可验证价格窗口", "market_acceptance": acceptance, "sector_ret": sector_ret, "sector_flow": sector_flow, "validation": f"验证：{industry}次日资金与龙头/中军是否同步。" if sector else "验证：先补充可映射的板块或标的。"})
+    chain_head = news_briefs[0] if news_briefs else None
+    logic_chain = [{"label": "国内消息", "value": chain_head.get("title") if chain_head else "暂无高价值消息", "evidence": f"时间 {chain_head.get('time')} · 价值 {chain_head.get('value_score')} · 可信度 {chain_head.get('trust_score')}" if chain_head else "暂无真实消息"}, {"label": "影响对象", "value": chain_head.get("industry") if chain_head else "未映射", "evidence": chain_head.get("impact_type") if chain_head else "暂无证据"}, {"label": "资金验证", "value": lead_in or "暂无承接方向", "evidence": f"板块5日净流 {float(sector_map.get(lead_in, {}).get('net_mf_yi') or 0):.2f}亿" if lead_in else "暂无数据"}, {"label": "价格验证", "value": market_state, "evidence": f"个股等权 {mean_ret:.2f}% · 上涨宽度 {breadth:.1f}%" if breadth is not None else "暂无数据"}, {"label": "判断", "value": "相关但尚不能确认主要因果" if not chain_head or chain_head.get("market_acceptance") != "价格与资金初步认可" else "价格与资金初步认可", "evidence": "时间相关性不等于因果，需下一交易日复核"}]
     flow_frame = pd.DataFrame(flows)
     market_flow_series = []
     rotation_timeline = []
@@ -237,6 +260,7 @@ def build():
         "validation": f"验证点：观察 {lead_in or '最强承接方向'} 次日是否继续净流入，并确认龙头、中军与板块同步。",
         "invalidation": "失效条件：资金广度转负、最强板块跌破前一交易日低点，或利好方向出现放量冲高回落。",
         "news_briefs": news_briefs,
+        "logic_chain": logic_chain,
         "market_flow_series": market_flow_series,
         "rotation_timeline": rotation_timeline,
         "flow_periods": [{"period": "5分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "15分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "30分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "当日", "available": bool(market_flow_series), "reason": "按板块日级主力净流合计"}, {"period": "3日", "available": len(market_flow_series) >= 3, "reason": "按最近可用交易日合计"}, {"period": "5日", "available": len(market_flow_series) >= 5, "reason": "按最近可用交易日合计"}, {"period": "20日", "available": False, "reason": "当前快照不足20个交易日资金明细"}],
