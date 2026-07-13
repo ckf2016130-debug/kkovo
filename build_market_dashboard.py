@@ -38,6 +38,13 @@ def load_etfs():
         out = basic.merge(last, on="ts_code", how="inner").merge(first, on="ts_code", how="left")
         out["week_ret"] = (out["close"] / out["start_close"] - 1) * 100
         out["amount_yi"] = pd.to_numeric(out.get("amount"), errors="coerce") / 100000000
+        # Keep ETFs with actual market reference value; debt, currency and tiny inactive samples are noise here.
+        name_text = out.get("name", pd.Series("", index=out.index)).fillna("").astype(str)
+        excluded = name_text.str.contains("债|货币|同业存单|短融|国债|政金|美元|日元", regex=True)
+        liquid = out[~excluded & (out["amount_yi"] >= 1)].copy()
+        if liquid.empty:
+            liquid = out[~excluded].copy()
+        out = liquid
         out = out.sort_values("amount_yi", ascending=False)
         return records(out[[c for c in ["ts_code", "name", "fund_type", "trade_date", "close", "week_ret", "amount_yi"] if c in out]])
     except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
@@ -54,6 +61,8 @@ def load_data():
         fina = pd.read_csv(fina_path).sort_values("ann_date").drop_duplicates("ts_code", keep="last")
         fields = ["ts_code", "ann_date", "eps", "bps", "fcfe_ps", "roe", "grossprofit_margin", "netprofit_margin", "debt_to_assets", "current_ratio", "q_ocf_to_sales", "q_sales_yoy", "netprofit_yoy", "ocf_yoy"]
         stocks = stocks.merge(fina[[c for c in fields if c in fina]], on="ts_code", how="left")
+    # The weekly source can contain one row per joined snapshot. Keep one canonical row per security.
+    stocks = stocks.sort_values(["ts_code", "trade_date"] if "trade_date" in stocks.columns else ["ts_code"]).drop_duplicates("ts_code", keep="last")
     for c in ["ann_date", "eps", "bps", "fcfe_ps", "roe", "grossprofit_margin", "netprofit_margin", "debt_to_assets", "current_ratio", "q_ocf_to_sales", "q_sales_yoy", "netprofit_yoy", "ocf_yoy"]:
         if c not in stocks:
             stocks[c] = 0
@@ -159,6 +168,35 @@ def build():
         sample = stocks_frame.loc[mask]
         value = float(sample["net_mf_5d_yi"].sum()) if not sample.empty else None
         proxy_funds.append({"name": name, "value": value, "direction": "净流入" if value is not None and value > 0 else "净流出" if value is not None and value < 0 else "暂无数据", "coverage": int(len(sample)), "basis": basis, "confidence": "中" if len(sample) >= 30 else "低"})
+    for sector in sectors:
+        sector_rows = stocks_frame[stocks_frame["industry"] == sector.get("industry")]
+        sector["agent_flows"] = []
+        for name, mask, basis in proxy_specs:
+            sample = stocks_frame.loc[mask & stocks_frame["industry"].eq(sector.get("industry"))]
+            value = float(sample["net_mf_5d_yi"].sum()) if not sample.empty else None
+            sector["agent_flows"].append({"name": name, "value": value, "direction": "净流入" if value is not None and value > 0 else "净流出" if value is not None and value < 0 else "暂无数据", "coverage": int(len(sample)), "basis": basis})
+    agent_series = []
+    stock_class = stocks_frame[["ts_code", "circ_mv_yi", "turnover_rate", "U", "Z"]].copy()
+    cap_mid = stocks_frame["circ_mv_yi"].median()
+    turn_mid = stocks_frame["turnover_rate"].median()
+    for path in sorted((ROOT / "data").glob("moneyflow_*.csv")):
+        try:
+            mf = pd.read_csv(path)
+            mf["net_mf_amount"] = pd.to_numeric(mf["net_mf_amount"], errors="coerce")
+            merged = mf.merge(stock_class, on="ts_code", how="inner").dropna(subset=["net_mf_amount"])
+            net = merged["net_mf_amount"]
+            masks = {
+                "国家队代理": (merged["circ_mv_yi"] >= cap_mid) & (net > 0),
+                "机构代理": (merged["circ_mv_yi"] >= cap_mid) & (merged["turnover_rate"] <= turn_mid) & (net > 0),
+                "游资代理": (merged["U"].fillna(0) + merged["Z"].fillna(0) > 0) & (merged["turnover_rate"] >= turn_mid),
+                "散户代理": (merged["circ_mv_yi"] < cap_mid) & (merged["turnover_rate"] >= turn_mid),
+            }
+            date = str(mf["trade_date"].iloc[0]) if not mf.empty else path.stem.split("_")[-1]
+            for name, mask in masks.items():
+                value = float(net.loc[mask].sum()) / 100000 if mask.any() else None
+                agent_series.append({"trade_date": date, "name": name, "value": round(value, 2) if value is not None else None})
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
+            continue
     top_in = sorted(sectors, key=lambda x: float(x.get("net_mf_yi") or 0), reverse=True)[:3]
     top_out = sorted(sectors, key=lambda x: float(x.get("net_mf_yi") or 0))[:3]
     proxy_links = [{"source": p["name"], "target": s.get("industry"), "value": abs(float(p["value"] or 0)) / max(len(top_in), 1)} for p in proxy_funds for s in top_in if (p["value"] or 0) > 0]
@@ -204,7 +242,7 @@ def build():
         if not affected_stock and industry in stocks_frame.get("industry", pd.Series(dtype=str)).values:
             candidates = stocks_frame[stocks_frame["industry"] == industry].sort_values("leader_score", ascending=False)
             affected_stock = candidates.iloc[0].get("name") if not candidates.empty else None
-        news_briefs.append({"title": item.get("title"), "time": item.get("time"), "industry": industry, "name": affected_stock, "direction": direction, "value_score": item.get("value_score"), "trust_score": item.get("trust_score"), "reason": item.get("reasons"), "impact_type": "直接影响" if direct else "间接映射", "impact_scope": "个股+所属板块" if direct else "板块观察", "consumption": "当前快照无法确认，需结合消息前后价格" if sector else "暂无可验证价格窗口", "market_acceptance": acceptance, "sector_ret": sector_ret, "sector_flow": sector_flow, "validation": f"验证：{industry}次日资金与龙头/中军是否同步。" if sector else "验证：先补充可映射的板块或标的。"})
+        news_briefs.append({"title": item.get("title"), "url": item.get("url"), "time": item.get("time"), "industry": industry, "name": affected_stock, "direction": direction, "value_score": item.get("value_score"), "trust_score": item.get("trust_score"), "reason": item.get("reasons"), "impact_type": "直接影响" if direct else "间接映射", "impact_scope": "个股+所属板块" if direct else "板块观察", "consumption": "当前快照无法确认，需结合消息前后价格" if sector else "暂无可验证价格窗口", "market_acceptance": acceptance, "sector_ret": sector_ret, "sector_flow": sector_flow, "validation": f"验证：{industry}次日资金与龙头/中军是否同步。" if sector else "验证：先补充可映射的板块或标的。"})
     chain_head = news_briefs[0] if news_briefs else None
     logic_chain = [{"label": "国内消息", "value": chain_head.get("title") if chain_head else "暂无高价值消息", "evidence": f"时间 {chain_head.get('time')} · 价值 {chain_head.get('value_score')} · 可信度 {chain_head.get('trust_score')}" if chain_head else "暂无真实消息"}, {"label": "影响对象", "value": chain_head.get("industry") if chain_head else "未映射", "evidence": chain_head.get("impact_type") if chain_head else "暂无证据"}, {"label": "资金验证", "value": lead_in or "暂无承接方向", "evidence": f"板块5日净流 {float(sector_map.get(lead_in, {}).get('net_mf_yi') or 0):.2f}亿" if lead_in else "暂无数据"}, {"label": "价格验证", "value": market_state, "evidence": f"个股等权 {mean_ret:.2f}% · 上涨宽度 {breadth:.1f}%" if breadth is not None else "暂无数据"}, {"label": "判断", "value": "相关但尚不能确认主要因果" if not chain_head or chain_head.get("market_acceptance") != "价格与资金初步认可" else "价格与资金初步认可", "evidence": "时间相关性不等于因果，需下一交易日复核"}]
     flow_frame = pd.DataFrame(flows)
@@ -265,6 +303,7 @@ def build():
         "rotation_timeline": rotation_timeline,
         "flow_periods": [{"period": "5分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "15分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "30分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "当日", "available": bool(market_flow_series), "reason": "按板块日级主力净流合计"}, {"period": "3日", "available": len(market_flow_series) >= 3, "reason": "按最近可用交易日合计"}, {"period": "5日", "available": len(market_flow_series) >= 5, "reason": "按最近可用交易日合计"}, {"period": "20日", "available": False, "reason": "当前快照不足20个交易日资金明细"}],
         "proxy_funds": proxy_funds,
+        "agent_series": agent_series,
         "proxy_links": proxy_links,
         "rotation_paths": rotation_paths,
     }

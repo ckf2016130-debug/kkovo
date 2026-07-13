@@ -36,12 +36,13 @@ def main():
     manifest = []
 
     end_date = date.today()
-    cal = pro.trade_cal(exchange="SSE", start_date=(end_date - timedelta(days=14)).strftime("%Y%m%d"), end_date=end_date.strftime("%Y%m%d"))
-    dates = sorted(cal.loc[cal["is_open"] == 1, "cal_date"].astype(str).tolist())
-    dates = dates[-5:]
+    cal = pro.trade_cal(exchange="SSE", start_date=(end_date - timedelta(days=120)).strftime("%Y%m%d"), end_date=end_date.strftime("%Y%m%d"))
+    all_dates = sorted(cal.loc[cal["is_open"] == 1, "cal_date"].astype(str).tolist())
+    history_dates = all_dates[-60:]
+    dates = history_dates[-5:]
     start_date, end_date = dates[0], dates[-1]
-    print("Window:", start_date, end_date)
-    print("Trading dates:", dates)
+    print("K-line window:", history_dates[0], history_dates[-1])
+    print("Flow window:", start_date, end_date)
 
     manifest.append(fetch(
         pro, "stock_basic", "stock_basic.csv", exchange="", list_status="L",
@@ -52,20 +53,23 @@ def main():
         fields="ts_code,name,management,market,fund_type,list_date"
     ))
 
-    for trade_date in dates:
+    for trade_date in history_dates:
         for api_name, prefix, fields in [
             ("daily", "daily", ""),
             ("daily_basic", "daily_basic", "ts_code,trade_date,close,turnover_rate,turnover_rate_f,volume_ratio,pe,pb,total_share,float_share,free_share,total_mv,circ_mv"),
             ("moneyflow", "moneyflow", ""),
             ("limit_list_d", "limit_list", ""),
         ]:
+            if trade_date not in dates and api_name != "daily":
+                continue
             kwargs = {"trade_date": trade_date}
             if fields:
                 kwargs["fields"] = fields
             manifest.append(fetch(pro, api_name, f"{prefix}_{trade_date}.csv", **kwargs))
             time.sleep(0.25)
-        manifest.append(fetch(pro, "fund_daily", f"etf_daily_{trade_date}.csv", trade_date=trade_date))
-        time.sleep(0.25)
+        if trade_date in dates:
+            manifest.append(fetch(pro, "fund_daily", f"etf_daily_{trade_date}.csv", trade_date=trade_date))
+            time.sleep(0.25)
 
     for api_name, filename, kwargs in [
         ("index_classify", "sw_index_classify.csv", {"level": "L1", "src": "SW2021"}),
