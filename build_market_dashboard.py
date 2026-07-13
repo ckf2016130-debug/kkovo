@@ -185,6 +185,17 @@ def load_data():
                     etf_frame[column] = etf_frame[derived].where(etf_frame[derived].notna(), etf_frame.get(column))
             etfs = records(etf_frame.drop(columns=[c for c in etf_frame.columns if c.endswith("_derived")], errors="ignore"))
     overseas = load_overseas()
+    if etfs and overseas:
+        overseas_terms = {"纳斯达克": "纳斯达克", "NASDAQ": "纳斯达克", "标普": "标普500", "S&P": "标普500", "日经": "日经225", "台湾": "中国台湾加权", "韩国": "韩国综合", "半导体": "费城半导体"}
+        overseas_map = {x.get("asset"): x for x in overseas}
+        for etf in etfs:
+            text = f"{etf.get('name') or ''} {etf.get('benchmark') or ''}".upper()
+            matched = next((asset for term, asset in overseas_terms.items() if term.upper() in text), None)
+            linked = overseas_map.get(matched) if matched else None
+            etf["overseas_asset"] = matched
+            etf["overseas_ret_5d"] = linked.get("ret_5d") if linked else None
+            etf["overseas_ret_20d"] = linked.get("ret_20d") if linked else None
+            etf["overseas_link_note"] = "仅作同类资产联动观察，不代表因果" if linked else None
     stock_flows = []
     for path in sorted((ROOT / "data").glob("moneyflow_*.csv")):
         try:
