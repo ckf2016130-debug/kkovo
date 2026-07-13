@@ -155,6 +155,15 @@ def build():
     top_out = sorted(sectors, key=lambda x: float(x.get("net_mf_yi") or 0))[:3]
     proxy_links = [{"source": p["name"], "target": s.get("industry"), "value": abs(float(p["value"] or 0)) / max(len(top_in), 1)} for p in proxy_funds for s in top_in if (p["value"] or 0) > 0]
     rotation_paths = [{"from": s.get("industry"), "to": t.get("industry"), "value": round(min(abs(float(s.get("net_mf_yi") or 0)), abs(float(t.get("net_mf_yi") or 0))), 2), "confidence": "中"} for s, t in zip(top_out, top_in)]
+    strongest = max(sectors, key=lambda x: float(x.get("strength") or 0), default={})
+    rotation_candidates = [x for x in sectors if x.get("state") == "潜在轮入"]
+    trade_sector = max(rotation_candidates or sectors, key=lambda x: float(x.get("breadth") or 0) + max(float(x.get("net_mf_yi") or 0), 0) / 100, default={})
+    if mean_ret > 0 and (positive_flow or 0) < 50:
+        main_conflict = "指数和个股表现改善，但资金广度不足，仍是存量轮动而非全面增量"
+    elif (breadth or 0) < 40 and (positive_flow or 0) < 45:
+        main_conflict = "上涨家数与资金承接同步偏弱，主要矛盾是风险偏好收缩"
+    else:
+        main_conflict = "上涨宽度、资金流和涨停结构共同决定下一步是延续还是分歧"
     summary = {
         "stock_count": len(stocks),
         "sector_count": len(sectors),
@@ -176,6 +185,12 @@ def build():
         "market_state": market_state,
         "strategy": strategy,
         "avoid_strategy": "不追逐高位无资金承接的涨幅，不把估算身份当作真实账户归属",
+        "main_conflict": main_conflict,
+        "primary_reason": "上涨宽度、五日主力资金、涨停/炸板结构与板块相对强弱的规则合成",
+        "strongest_sector": strongest.get("industry"),
+        "strongest_sector_score": strongest.get("strength"),
+        "trade_sector": trade_sector.get("industry"),
+        "trade_sector_reason": "优先观察有资金承接且上涨宽度较好的方向，仍需下一交易日验证",
         "position": round(min(80, max(20, money_effect * 0.7)), 0),
         "confidence": "中",
         "proxy_funds": proxy_funds,
