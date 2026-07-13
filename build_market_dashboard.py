@@ -14,9 +14,9 @@ def records(df):
 
 
 def load_data():
-    sectors = pd.read_csv(ROOT / "output" / "sector_rotation.csv").fillna(0)
-    stocks = pd.read_csv(ROOT / "output" / "stock_week_metrics.csv").fillna(0)
-    sector_flow = pd.read_csv(ROOT / "output" / "sector_daily_flow.csv").fillna(0)
+    sectors = pd.read_csv(ROOT / "output" / "sector_rotation.csv")
+    stocks = pd.read_csv(ROOT / "output" / "stock_week_metrics.csv")
+    sector_flow = pd.read_csv(ROOT / "output" / "sector_daily_flow.csv")
 
     fina_path = ROOT / "data" / "fundamentals" / "fina_indicator_vip_20260331.csv"
     if fina_path.exists():
@@ -63,21 +63,27 @@ def load_data():
         records(sectors[sector_cols]),
         records(stocks[stock_cols]),
         records(sector_flow[["industry", "trade_date", "net_mf_yi"]]),
-        records(price.fillna(0)) if not price.empty else [],
+        records(price) if not price.empty else [],
     )
 
 
 def build():
     sectors, stocks, flows, prices = load_data()
     news_path = ROOT / "data" / "news" / "news_scored.csv"
-    news = records(pd.read_csv(news_path).fillna("")) if news_path.exists() else []
+    news = records(pd.read_csv(news_path)) if news_path.exists() else []
+    numeric_stocks = pd.to_numeric(pd.Series([x.get("week_ret") for x in stocks]), errors="coerce").dropna()
+    generated_at = pd.Timestamp.now(tz="Asia/Shanghai").isoformat(timespec="seconds")
     summary = {
         "stock_count": len(stocks),
         "sector_count": len(sectors),
-        "mean_ret": sum(x["week_ret"] for x in stocks) / max(len(stocks), 1),
-        "breadth": sum(x["week_ret"] > 0 for x in stocks) / max(len(stocks), 1) * 100,
-        "total_flow": sum(x["net_mf_5d_yi"] for x in stocks),
+        "mean_ret": float(numeric_stocks.mean()) if not numeric_stocks.empty else None,
+        "breadth": float((numeric_stocks > 0).mean() * 100) if not numeric_stocks.empty else None,
+        "total_flow": float(pd.to_numeric(pd.Series([x.get("net_mf_5d_yi") for x in stocks]), errors="coerce").sum(min_count=1)),
         "price_dates": sorted({str(x["trade_date"]) for x in prices}),
+        "generated_at": generated_at,
+        "source": "TinyShare授权接口 + 本地消息快照",
+        "freshness": "按最近成功抓取批次生成；非实时",
+        "estimated": True,
     }
     template = (ROOT / "market_dashboard_template.html").read_text(encoding="utf-8")
     replacements = {
