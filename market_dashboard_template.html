@@ -116,4 +116,10 @@ function renderEtfEvidence(){
   box.innerHTML=`<table class="etf-table"><thead><tr><th>名称/代码</th><th>跟踪基准</th><th>窗口涨跌</th><th>成交额(亿)</th><th>成分数</th><th>前十大权重</th><th>行业暴露前五</th><th>申赎替代参考</th></tr></thead><tbody>${etfs.slice(0,8).map(x=>{const exposure=(x.industry_exposure||[]).map(v=>`${escHtml(v.industry)} ${fmt(v.weight,1)}%`).join('、');return `<tr><td>${escHtml(x.name||x.ts_code)}<small>${escHtml(x.ts_code||'')}</small></td><td title="${escHtml(x.benchmark||'')}">${escHtml(x.benchmark||'未提供')}</td><td class="${cls(x.week_ret)}">${fmt(x.week_ret)}%</td><td>${fmt(x.amount_yi)}</td><td>${fmt(x.component_count,0)}</td><td>${fmt(x.top10_weight,1)}%</td><td title="${exposure}">${exposure||'未提供权重'}</td><td>${fmt(x.cpr_mean,2)}</td></tr>`}).join('')}</tbody></table><div class="source">筛选口径：仅展示有真实行情成交额的 ETF；成分数、前十大权重和行业暴露来自最近一次成分快照，缺失时不补零。行情成交额不等于申赎资金，申赎替代参考仅在接口提供 CPR 时显示。</div>`;
 }
 renderEtfEvidence();
+function renderImpactEvidence(){
+  const map=document.querySelector('#newsImpactMap');if(!map)return;
+  const rows=(summary.news_briefs||news).slice().sort((a,b)=>Number(b.value_score||0)-Number(a.value_score||0)).slice(0,12);
+  map.innerHTML=rows.map(x=>`<div class="impact-item"><b>${escHtml(x.title||'未知消息')}</b><small>${escHtml(x.time||'未知时间')} · ${escHtml(x.direction||'中性')} · 影响价值 ${fmt(x.value_score,0)} · 可信度 ${fmt(x.trust_score,0)}</small><small>范围：${escHtml(x.impact_scope||'暂无映射')} · 类型：${escHtml(x.impact_type||'暂无判断')}</small><small>个股：${escHtml(x.affected_stock||'暂无')} · ETF：${escHtml(x.affected_etf||'暂无')}</small><em>市场认可：${escHtml(x.market_acceptance||'尚未验证')}</em><small>验证：${escHtml(x.validation||'暂无验证条件')}</small></div>`).join('')||'<div class="empty">暂无可验证消息影响</div>';
+}
+renderImpactEvidence();
 </script></body></html>

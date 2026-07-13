@@ -341,11 +341,20 @@ def build():
         if not affected_stock and industry in stocks_frame.get("industry", pd.Series(dtype=str)).values:
             candidates = stocks_frame[stocks_frame["industry"] == industry].sort_values("leader_score", ascending=False)
             affected_stock = candidates.iloc[0].get("name") if not candidates.empty else None
-        impact = {"impact_type": "直接影响" if direct else "间接映射", "impact_scope": "个股+所属板块" if direct else "板块观察", "consumption": "当前快照无法确认，需结合消息前后价格" if sector else "暂无可验证价格窗口", "market_acceptance": acceptance, "sector_ret": sector_ret, "sector_flow": sector_flow, "validation": f"验证：{industry}次日资金与龙头/中军是否同步。" if sector else "验证：先补充可映射的板块或标的。", "affected_stock": affected_stock}
+        etf_candidates = [x for x in etfs if industry and (industry in str(x.get("name") or "") or industry in str(x.get("benchmark") or ""))]
+        if not etf_candidates and sector:
+            etf_candidates = sorted(etfs, key=lambda x: float(x.get("amount_yi") or 0), reverse=True)[:1]
+        affected_etf = (etf_candidates[0].get("name") or etf_candidates[0].get("ts_code")) if etf_candidates else None
+        scope = "个股+板块+ETF" if direct and affected_etf else "板块+ETF观察" if affected_etf else "个股+所属板块" if direct else "板块观察"
+        impact = {"impact_type": "直接影响" if direct else "间接映射", "impact_scope": scope, "consumption": "当前快照无法确认，需结合消息前后价格" if sector else "暂无可验证价格窗口", "market_acceptance": acceptance, "sector_ret": sector_ret, "sector_flow": sector_flow, "validation": f"验证：{industry}次日资金、龙头/中军与 ETF 是否同步。" if sector else "验证：先补充可映射的板块或标的。", "affected_stock": affected_stock, "affected_etf": affected_etf}
         item.update(impact)
         news_briefs.append({"title": item.get("title"), "url": item.get("url"), "time": item.get("time"), "industry": industry, "name": affected_stock, "direction": direction, "value_score": item.get("value_score"), "trust_score": item.get("trust_score"), "reason": item.get("reasons"), **impact})
     chain_head = news_briefs[0] if news_briefs else None
-    logic_chain = [{"label": "国内消息", "value": chain_head.get("title") if chain_head else "暂无高价值消息", "evidence": f"时间 {chain_head.get('time')} · 价值 {chain_head.get('value_score')} · 可信度 {chain_head.get('trust_score')}" if chain_head else "暂无真实消息"}, {"label": "影响对象", "value": chain_head.get("industry") if chain_head else "未映射", "evidence": chain_head.get("impact_type") if chain_head else "暂无证据"}, {"label": "资金验证", "value": lead_in or "暂无承接方向", "evidence": f"板块5日净流 {float(sector_map.get(lead_in, {}).get('net_mf_yi') or 0):.2f}亿" if lead_in else "暂无数据"}, {"label": "价格验证", "value": market_state, "evidence": f"个股等权 {mean_ret:.2f}% · 上涨宽度 {breadth:.1f}%" if breadth is not None else "暂无数据"}, {"label": "判断", "value": "相关但尚不能确认主要因果" if not chain_head or chain_head.get("market_acceptance") != "价格与资金初步认可" else "价格与资金初步认可", "evidence": "时间相关性不等于因果，需下一交易日复核"}]
+    overseas_lead = next((x for x in overseas if x.get("targets")), None)
+    logic_chain = [{"label": "国内消息", "value": chain_head.get("title") if chain_head else "暂无高价值消息", "evidence": f"时间 {chain_head.get('time')} · 价值 {chain_head.get('value_score')} · 可信度 {chain_head.get('trust_score')}" if chain_head else "暂无真实消息"}]
+    if overseas_lead:
+        logic_chain.append({"label": "海外变量", "value": overseas_lead.get("asset"), "evidence": f"5日 {overseas_lead.get('ret_5d')}% · 映射 { '、'.join(overseas_lead.get('targets') or []) } · {overseas_lead.get('state')}"})
+    logic_chain.extend([{"label": "影响对象", "value": chain_head.get("industry") if chain_head else "未映射", "evidence": f"{chain_head.get('impact_type')} · {chain_head.get('impact_scope')}" if chain_head else "暂无证据"}, {"label": "资金验证", "value": lead_in or "暂无承接方向", "evidence": f"板块5日净流 {float(sector_map.get(lead_in, {}).get('net_mf_yi') or 0):.2f}亿" if lead_in else "暂无数据"}, {"label": "价格验证", "value": market_state, "evidence": f"个股等权 {mean_ret:.2f}% · 上涨宽度 {breadth:.1f}%" if breadth is not None else "暂无数据"}, {"label": "判断", "value": "相关但尚不能确认主要因果" if not chain_head or chain_head.get("market_acceptance") != "价格与资金初步认可" else "价格与资金初步认可", "evidence": "时间相关性不等于因果，需下一交易日复核"}])
     overseas_conduction = []
     price_frame = pd.DataFrame(prices)
     if not price_frame.empty and "pct_chg" in price_frame:
