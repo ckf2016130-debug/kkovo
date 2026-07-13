@@ -117,7 +117,9 @@ def load_data():
     stocks = stocks.sort_values(["ts_code", "trade_date"] if "trade_date" in stocks.columns else ["ts_code"]).drop_duplicates("ts_code", keep="last")
     for c in ["ann_date", "eps", "bps", "fcfe_ps", "roe", "grossprofit_margin", "netprofit_margin", "debt_to_assets", "current_ratio", "q_ocf_to_sales", "q_sales_yoy", "netprofit_yoy", "ocf_yoy"]:
         if c not in stocks:
-            stocks[c] = 0
+            # Missing fundamentals stay missing. Zero would be interpreted as a real
+            # observation and would distort peer ranks and valuation assumptions.
+            stocks[c] = pd.NA
         stocks[c] = pd.to_numeric(stocks[c], errors="coerce")
 
     def industry_rank(column, ascending=True):

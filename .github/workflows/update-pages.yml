@@ -46,6 +46,11 @@ jobs:
           TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
         run: python fetch_tinyshare_week.py || echo "Market source timeout or authorization lock; previous snapshot will be used"
 
+      - name: Ensure K-line history window
+        env:
+          TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
+        run: python fetch_tinyshare_history.py || echo "K-line history source timeout; previous history snapshot will be used"
+
       - name: Fetch overseas market data
         run: python fetch_overseas.py || echo "Overseas source timeout or failure; previous snapshot will be used"
 
