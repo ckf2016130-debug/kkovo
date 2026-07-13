@@ -455,6 +455,18 @@ def build():
     for key, value in replacements.items():
         template = template.replace(key, value)
     OUT.mkdir(parents=True, exist_ok=True)
+    context = {
+        "generated_at": generated_at,
+        "source": summary["source"],
+        "freshness": summary["freshness"],
+        "summary": summary,
+        "top_sectors": sorted(sectors, key=lambda x: float(x.get("strength") or 0), reverse=True)[:10],
+        "trade_value_sectors": sorted(sectors, key=lambda x: float(x.get("trade_value_score") or 0), reverse=True)[:10],
+        "messages": news_briefs,
+        "overseas_conduction": overseas_conduction,
+        "validation_note": "结构化上下文供解释层读取；相关性不等于因果，所有结论必须回到验证点和失效条件。",
+    }
+    (OUT / "market_context.json").write_text(json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8")
     vendor = OUT / "vendor"
     vendor.mkdir(exist_ok=True)
     for name in ["echarts.min.js", "tabulator.min.js", "tabulator_midnight.min.css"]:
