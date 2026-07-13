@@ -48,7 +48,7 @@ def load_etfs():
             liquid = out[~excluded].copy()
         out = liquid
         out = out.sort_values("amount_yi", ascending=False)
-        return records(out[[c for c in ["ts_code", "name", "fund_type", "trade_date", "close", "week_ret", "amount_yi"] if c in out]])
+        return records(out[[c for c in ["ts_code", "name", "fund_type", "benchmark", "invest_type", "issue_amount", "trade_date", "close", "week_ret", "amount_yi"] if c in out]])
     except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
         return []
 

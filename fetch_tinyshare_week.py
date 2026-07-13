@@ -50,7 +50,7 @@ def main():
     ))
     manifest.append(fetch(
         pro, "fund_basic", "etf_basic.csv", market="E", status="L", fund_type="ETF",
-        fields="ts_code,name,management,market,fund_type,list_date"
+        fields="ts_code,name,management,market,fund_type,list_date,benchmark,invest_type,type,issue_amount"
     ))
 
     for trade_date in history_dates:
