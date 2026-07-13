@@ -47,6 +47,10 @@ def main():
         pro, "stock_basic", "stock_basic.csv", exchange="", list_status="L",
         fields="ts_code,symbol,name,area,industry,market,list_date"
     ))
+    manifest.append(fetch(
+        pro, "fund_basic", "etf_basic.csv", market="E", status="L", fund_type="ETF",
+        fields="ts_code,name,management,market,fund_type,list_date"
+    ))
 
     for trade_date in dates:
         for api_name, prefix, fields in [
@@ -60,6 +64,8 @@ def main():
                 kwargs["fields"] = fields
             manifest.append(fetch(pro, api_name, f"{prefix}_{trade_date}.csv", **kwargs))
             time.sleep(0.25)
+        manifest.append(fetch(pro, "fund_daily", f"etf_daily_{trade_date}.csv", trade_date=trade_date))
+        time.sleep(0.25)
 
     for api_name, filename, kwargs in [
         ("index_classify", "sw_index_classify.csv", {"level": "L1", "src": "SW2021"}),

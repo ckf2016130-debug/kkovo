@@ -13,6 +13,37 @@ def records(df):
     return json.loads(df.to_json(orient="records", force_ascii=False))
 
 
+def load_etfs():
+    basic_path = ROOT / "data" / "etf_basic.csv"
+    if not basic_path.exists():
+        return []
+    try:
+        basic = pd.read_csv(basic_path)
+        paths = sorted((ROOT / "data").glob("etf_daily_*.csv"))
+        rows = []
+        for path in paths:
+            if path.stat().st_size <= 20:
+                continue
+            frame = pd.read_csv(path)
+            if not frame.empty:
+                rows.append(frame)
+        if not rows:
+            return []
+        daily = pd.concat(rows, ignore_index=True)
+        daily["trade_date"] = daily["trade_date"].astype(str)
+        daily["close"] = pd.to_numeric(daily["close"], errors="coerce")
+        daily = daily.dropna(subset=["ts_code", "trade_date", "close"]).sort_values(["ts_code", "trade_date"])
+        first = daily.groupby("ts_code", as_index=False).first()[["ts_code", "trade_date", "close"]].rename(columns={"trade_date":"start_date", "close":"start_close"})
+        last = daily.groupby("ts_code", as_index=False).last()[["ts_code", "trade_date", "close", "amount"]].rename(columns={"trade_date":"trade_date", "close":"close", "amount":"amount"})
+        out = basic.merge(last, on="ts_code", how="inner").merge(first, on="ts_code", how="left")
+        out["week_ret"] = (out["close"] / out["start_close"] - 1) * 100
+        out["amount_yi"] = pd.to_numeric(out.get("amount"), errors="coerce") / 100000000
+        out = out.sort_values("amount_yi", ascending=False)
+        return records(out[[c for c in ["ts_code", "name", "fund_type", "trade_date", "close", "week_ret", "amount_yi"] if c in out]])
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
+        return []
+
+
 def load_data():
     sectors = pd.read_csv(ROOT / "output" / "sector_rotation.csv")
     stocks = pd.read_csv(ROOT / "output" / "stock_week_metrics.csv")
@@ -56,6 +87,7 @@ def load_data():
         except Exception:
             pass
     price = pd.concat(prices, ignore_index=True).drop_duplicates(["ts_code", "trade_date"]) if prices else pd.DataFrame()
+    etfs = load_etfs()
 
     sector_cols = ["rank", "industry", "state", "constituents", "week_ret", "median_ret", "net_mf_yi", "fri_flow_yi", "breadth", "turnover_yi", "flow_ratio", "limit_up", "broken", "limit_down", "strength"]
     stock_cols = ["industry", "name", "ts_code", "market", "week_ret", "fri_ret", "net_mf_5d_yi", "net_mf_fri_yi", "circ_mv_yi", "turnover_yi", "turnover_rate", "pe", "pb", "U", "Z", "D", "leader_score", "core_score", "elastic_score", "ann_date", "eps", "bps", "fcfe_ps", "roe", "grossprofit_margin", "netprofit_margin", "debt_to_assets", "current_ratio", "q_ocf_to_sales", "q_sales_yoy", "netprofit_yoy", "ocf_yoy", "quality_score", "growth_score", "cash_score", "leverage_score", "valuation_score", "fundamental_coverage", "fundamental_score"]
@@ -64,19 +96,69 @@ def load_data():
         records(stocks[stock_cols]),
         records(sector_flow[["industry", "trade_date", "net_mf_yi"]]),
         records(price) if not price.empty else [],
+        etfs,
     )
 
 
 def build():
-    sectors, stocks, flows, prices = load_data()
+    sectors, stocks, flows, prices, etfs = load_data()
     news_path = ROOT / "data" / "news" / "news_scored.csv"
     news = records(pd.read_csv(news_path)) if news_path.exists() else []
     numeric_stocks = pd.to_numeric(pd.Series([x.get("week_ret") for x in stocks]), errors="coerce").dropna()
     generated_at = pd.Timestamp.now(tz="Asia/Shanghai").isoformat(timespec="seconds")
+    pe = pd.to_numeric(pd.Series([x.get("pe") for x in stocks]), errors="coerce")
+    pe = pe[(pe > 0) & (pe < 300)].dropna()
+    median_pe = float(pe.median()) if not pe.empty else None
+    pe_history = []
+    for path in (ROOT / "data").glob("daily_basic_*.csv"):
+        try:
+            frame = pd.read_csv(path)
+            values = pd.to_numeric(frame.get("pe"), errors="coerce")
+            values = values[(values > 0) & (values < 300)].dropna()
+            if not values.empty:
+                pe_history.append(float(values.median()))
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+            continue
+    pe_percentile = float(sum(v <= median_pe for v in pe_history) / len(pe_history) * 100) if median_pe is not None and pe_history else None
+    breadth = float((numeric_stocks > 0).mean() * 100) if not numeric_stocks.empty else None
+    flow = pd.to_numeric(pd.Series([x.get("net_mf_5d_yi") for x in stocks]), errors="coerce")
+    positive_flow = float((flow > 0).mean() * 100) if not flow.dropna().empty else None
+    broken = sum(float(x.get("Z") or 0) for x in stocks)
+    limit_up = sum(float(x.get("U") or 0) for x in stocks)
+    sentiment = min(100, max(0, (breadth or 0) * 0.55 + (positive_flow or 0) * 0.25 + min(limit_up, 100) * 0.15 - min(broken, 100) * 0.10))
+    money_effect = min(100, max(0, (breadth or 0) * 0.65 + (positive_flow or 0) * 0.20 + min(limit_up, 100) * 0.15))
+    mean_ret = float(numeric_stocks.mean()) if not numeric_stocks.empty else 0
+    if breadth is not None and breadth >= 65 and mean_ret > 0:
+        market_state, strategy = "普涨修复", "适合进攻和强势板块跟踪"
+    elif breadth is not None and breadth <= 35 and mean_ret < 0:
+        market_state, strategy = "情绪退潮", "以防守和等待为主"
+    elif mean_ret > 0 and (positive_flow or 0) < 45:
+        market_state, strategy = "存量轮动", "低吸有资金承接的板块"
+    else:
+        market_state, strategy = "震荡观察", "控制仓位，等待确认"
+    stocks_frame = pd.DataFrame(stocks)
+    for col in ["circ_mv_yi", "turnover_rate", "net_mf_5d_yi", "U", "Z", "week_ret"]:
+        stocks_frame[col] = pd.to_numeric(stocks_frame.get(col), errors="coerce")
+    cap_mid = stocks_frame["circ_mv_yi"].median()
+    turn_mid = stocks_frame["turnover_rate"].median()
+    proxy_specs = [
+        ("国家队代理", (stocks_frame["circ_mv_yi"] >= cap_mid) & (stocks_frame["net_mf_5d_yi"] > 0), "大市值与权重股资金承接"),
+        ("机构代理", (stocks_frame["circ_mv_yi"] >= cap_mid) & (stocks_frame["turnover_rate"] <= turn_mid) & (stocks_frame["net_mf_5d_yi"] > 0), "大市值、低换手、持续净流入"),
+        ("游资代理", (stocks_frame["U"].fillna(0) + stocks_frame["Z"].fillna(0) > 0) & (stocks_frame["turnover_rate"] >= turn_mid), "涨停/炸板与高换手行为"),
+        ("散户代理", (stocks_frame["circ_mv_yi"] < cap_mid) & (stocks_frame["turnover_rate"] >= turn_mid), "小市值与高换手行为"),
+    ]
+    proxy_funds = []
+    for name, mask, basis in proxy_specs:
+        sample = stocks_frame.loc[mask]
+        proxy_funds.append({"name": name, "value": float(sample["net_mf_5d_yi"].sum()) if not sample.empty else None, "coverage": int(len(sample)), "basis": basis, "confidence": "中" if len(sample) >= 30 else "低"})
+    top_in = sorted(sectors, key=lambda x: float(x.get("net_mf_yi") or 0), reverse=True)[:3]
+    top_out = sorted(sectors, key=lambda x: float(x.get("net_mf_yi") or 0))[:3]
+    proxy_links = [{"source": p["name"], "target": s.get("industry"), "value": abs(float(p["value"] or 0)) / max(len(top_in), 1)} for p in proxy_funds for s in top_in if (p["value"] or 0) > 0]
+    rotation_paths = [{"from": s.get("industry"), "to": t.get("industry"), "value": round(min(abs(float(s.get("net_mf_yi") or 0)), abs(float(t.get("net_mf_yi") or 0))), 2), "confidence": "中"} for s, t in zip(top_out, top_in)]
     summary = {
         "stock_count": len(stocks),
         "sector_count": len(sectors),
-        "mean_ret": float(numeric_stocks.mean()) if not numeric_stocks.empty else None,
+        "mean_ret": mean_ret if not numeric_stocks.empty else None,
         "breadth": float((numeric_stocks > 0).mean() * 100) if not numeric_stocks.empty else None,
         "total_flow": float(pd.to_numeric(pd.Series([x.get("net_mf_5d_yi") for x in stocks]), errors="coerce").sum(min_count=1)),
         "price_dates": sorted({str(x["trade_date"]) for x in prices}),
@@ -84,6 +166,21 @@ def build():
         "source": "TinyShare授权接口 + 本地消息快照",
         "freshness": "按最近成功抓取批次生成；非实时",
         "estimated": True,
+        "sentiment_score": sentiment,
+        "money_effect_score": money_effect,
+        "valuation_median_pe": median_pe,
+        "valuation_percentile": pe_percentile,
+        "valuation_coverage": len(pe),
+        "etf_count": len(etfs),
+        "etf_window": sorted({str(x.get("trade_date")) for x in etfs if x.get("trade_date")}),
+        "market_state": market_state,
+        "strategy": strategy,
+        "avoid_strategy": "不追逐高位无资金承接的涨幅，不把估算身份当作真实账户归属",
+        "position": round(min(80, max(20, money_effect * 0.7)), 0),
+        "confidence": "中",
+        "proxy_funds": proxy_funds,
+        "proxy_links": proxy_links,
+        "rotation_paths": rotation_paths,
     }
     template = (ROOT / "market_dashboard_template.html").read_text(encoding="utf-8")
     replacements = {
@@ -93,6 +190,7 @@ def build():
         "__PRICES__": json.dumps(prices, ensure_ascii=False, separators=(",", ":")),
         "__SUMMARY__": json.dumps(summary, ensure_ascii=False, separators=(",", ":")),
         "__NEWS__": json.dumps(news, ensure_ascii=False, separators=(",", ":")),
+        "__ETFS__": json.dumps(etfs, ensure_ascii=False, separators=(",", ":")),
     }
     for key, value in replacements.items():
         template = template.replace(key, value)
