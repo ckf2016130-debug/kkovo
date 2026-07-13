@@ -296,6 +296,7 @@ def build():
             value = float(sample["net_mf_5d_yi"].sum()) if not sample.empty else None
             sector["agent_flows"].append({"name": name, "value": value, "direction": "净流入" if value is not None and value > 0 else "净流出" if value is not None and value < 0 else "暂无数据", "coverage": int(len(sample)), "basis": basis})
     agent_series = []
+    sector_agent_series = {}
     stock_class = stocks_frame[["ts_code", "circ_mv_yi", "turnover_rate", "U", "Z"]].copy()
     cap_mid = stocks_frame["circ_mv_yi"].median()
     turn_mid = stocks_frame["turnover_rate"].median()
@@ -315,8 +316,14 @@ def build():
             for name, mask in masks.items():
                 value = float(net.loc[mask].sum()) / 100000 if mask.any() else None
                 agent_series.append({"trade_date": date, "name": name, "value": round(value, 2) if value is not None else None})
+                if mask.any():
+                    grouped = merged.loc[mask].groupby("industry")["net_mf_amount"].sum() / 100000
+                    for industry, sector_value in grouped.items():
+                        sector_agent_series.setdefault(str(industry), []).append({"trade_date": date, "name": name, "value": round(float(sector_value), 2)})
         except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
             continue
+    for sector in sectors:
+        sector["agent_series"] = sector_agent_series.get(str(sector.get("industry")), [])
     flow_values = pd.to_numeric(pd.Series([x.get("net_mf_yi") for x in sectors]), errors="coerce")
     flow_rank = flow_values.rank(pct=True).fillna(0.5) * 100
     for sector, rank in zip(sectors, flow_rank.tolist()):
