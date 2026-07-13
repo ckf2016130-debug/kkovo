@@ -48,6 +48,22 @@ def load_etfs():
             liquid = out[~excluded].copy()
         out = liquid
         out = out.sort_values("amount_yi", ascending=False)
+        nav_rows = []
+        for nav_path in sorted((ROOT / "data").glob("fund_nav_*.csv")):
+            try:
+                nav = pd.read_csv(nav_path)
+                if {"ts_code", "unit_nav"}.issubset(nav.columns):
+                    nav["unit_nav"] = pd.to_numeric(nav["unit_nav"], errors="coerce")
+                    if "nav_date" not in nav:
+                        nav["nav_date"] = nav_path.stem.split("_")[-1]
+                    nav["nav_date"] = nav["nav_date"].astype(str)
+                    nav_rows.append(nav[[c for c in ["ts_code", "nav_date", "unit_nav", "accum_nav", "net_asset"] if c in nav.columns]])
+            except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+                continue
+        if nav_rows:
+            nav = pd.concat(nav_rows, ignore_index=True).sort_values(["ts_code", "nav_date"]).drop_duplicates("ts_code", keep="last")
+            out = out.merge(nav, on="ts_code", how="left")
+            out["premium_discount"] = (out["close"] / out["unit_nav"] - 1) * 100
         component_rows = []
         for component_path in sorted((ROOT / "data").glob("etf_*_cons_*.csv")):
             try:
@@ -61,7 +77,7 @@ def load_etfs():
             component = pd.concat(component_rows, ignore_index=True)
             component_summary = component.groupby("ts_code", as_index=False).agg(component_count=("con_code", "nunique"), cpr_mean=("cpr", "mean"))
             out = out.merge(component_summary, on="ts_code", how="left")
-        return records(out[[c for c in ["ts_code", "name", "fund_type", "benchmark", "invest_type", "issue_amount", "trade_date", "close", "week_ret", "amount_yi", "component_count", "cpr_mean"] if c in out]])
+        return records(out[[c for c in ["ts_code", "name", "fund_type", "benchmark", "invest_type", "issue_amount", "trade_date", "close", "week_ret", "amount_yi", "nav_date", "unit_nav", "accum_nav", "net_asset", "premium_discount", "component_count", "cpr_mean"] if c in out]])
     except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
         return []
 
