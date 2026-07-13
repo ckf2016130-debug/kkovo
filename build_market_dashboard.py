@@ -128,14 +128,21 @@ def build():
     sentiment = min(100, max(0, (breadth or 0) * 0.55 + (positive_flow or 0) * 0.25 + min(limit_up, 100) * 0.15 - min(broken, 100) * 0.10))
     money_effect = min(100, max(0, (breadth or 0) * 0.65 + (positive_flow or 0) * 0.20 + min(limit_up, 100) * 0.15))
     mean_ret = float(numeric_stocks.mean()) if not numeric_stocks.empty else 0
-    if breadth is not None and breadth >= 65 and mean_ret > 0:
-        market_state, strategy = "普涨修复", "适合进攻和强势板块跟踪"
+    total_stock_flow = float(flow.sum(min_count=1)) if not flow.dropna().empty else None
+    if breadth is not None and breadth >= 65 and mean_ret > 0 and (positive_flow or 0) >= 55 and (total_stock_flow or 0) > 0:
+        market_state, strategy = "增量上涨", "顺势跟随主线，但只做有资金和龙头验证的方向"
+    elif breadth is not None and breadth >= 55 and mean_ret > 0 and (total_stock_flow or 0) <= 0:
+        market_state, strategy = "缩量上涨", "控制追高，优先观察低位承接和回流确认"
+    elif breadth is not None and breadth <= 35 and mean_ret < 0 and (total_stock_flow or 0) < 0:
+        market_state, strategy = "放量下跌", "降低仓位，等待风险释放后再看修复"
     elif breadth is not None and breadth <= 35 and mean_ret < 0:
-        market_state, strategy = "情绪退潮", "以防守和等待为主"
-    elif mean_ret > 0 and (positive_flow or 0) < 45:
-        market_state, strategy = "存量轮动", "低吸有资金承接的板块"
+        market_state, strategy = "情绪退潮", "以防守和等待为主，不接力弱势反弹"
+    elif mean_ret > 0 and (positive_flow or 0) < 50:
+        market_state, strategy = "存量轮动", "低吸有资金承接的板块，避免追逐已经加速的方向"
+    elif breadth is not None and breadth >= 65 and mean_ret > 0:
+        market_state, strategy = "普涨修复", "可跟踪修复主线，但需要成交额和资金继续确认"
     else:
-        market_state, strategy = "震荡观察", "控制仓位，等待确认"
+        market_state, strategy = "高位分歧", "控制总仓位，等待强弱方向和资金流向重新收敛"
     stocks_frame = pd.DataFrame(stocks)
     for col in ["circ_mv_yi", "turnover_rate", "net_mf_5d_yi", "U", "Z", "week_ret"]:
         stocks_frame[col] = pd.to_numeric(stocks_frame.get(col), errors="coerce")
@@ -150,7 +157,8 @@ def build():
     proxy_funds = []
     for name, mask, basis in proxy_specs:
         sample = stocks_frame.loc[mask]
-        proxy_funds.append({"name": name, "value": float(sample["net_mf_5d_yi"].sum()) if not sample.empty else None, "coverage": int(len(sample)), "basis": basis, "confidence": "中" if len(sample) >= 30 else "低"})
+        value = float(sample["net_mf_5d_yi"].sum()) if not sample.empty else None
+        proxy_funds.append({"name": name, "value": value, "direction": "净流入" if value is not None and value > 0 else "净流出" if value is not None and value < 0 else "暂无数据", "coverage": int(len(sample)), "basis": basis, "confidence": "中" if len(sample) >= 30 else "低"})
     top_in = sorted(sectors, key=lambda x: float(x.get("net_mf_yi") or 0), reverse=True)[:3]
     top_out = sorted(sectors, key=lambda x: float(x.get("net_mf_yi") or 0))[:3]
     proxy_links = [{"source": p["name"], "target": s.get("industry"), "value": abs(float(p["value"] or 0)) / max(len(top_in), 1)} for p in proxy_funds for s in top_in if (p["value"] or 0) > 0]
@@ -164,6 +172,36 @@ def build():
         main_conflict = "上涨家数与资金承接同步偏弱，主要矛盾是风险偏好收缩"
     else:
         main_conflict = "上涨宽度、资金流和涨停结构共同决定下一步是延续还是分歧"
+    lead_in = top_in[0].get("industry") if top_in else None
+    lead_out = top_out[0].get("industry") if top_out else None
+    conclusion = f"市场处于{market_state}：{lead_out or '暂无明确流出方向'}资金流出，{lead_in or '暂无明确承接方向'}承接；指数与个股的同步性仍需下一交易日确认。"
+    reason_blocks = {
+        "primary": f"主因：上涨宽度 {breadth:.1f}%、平均涨跌 {mean_ret:.2f}% 与资金广度 {positive_flow:.1f}% 共同指向{market_state}。" if breadth is not None and positive_flow is not None else "主因：关键市场宽度或资金数据缺失，暂不能确认。",
+        "secondary": f"次因：资金最强方向为 {lead_in or '—'}，相对流出方向为 {lead_out or '—'}。",
+        "buffer": f"缓冲因素：涨停 {limit_up:.0f} 家、炸板 {broken:.0f} 家，局部风险偏好仍有支撑。",
+        "reverse": "反向因素：若资金广度继续下降、强势板块由流入转流出，当前判断失效。",
+    }
+    news_top = sorted(news, key=lambda x: float(x.get("value_score") or 0), reverse=True)[:3]
+    news_briefs = [{"title": x.get("title"), "time": x.get("time"), "industry": x.get("industry"), "name": x.get("name"), "direction": "偏利好" if float(x.get("direction_score") or 0) > 10 else "偏利空" if float(x.get("direction_score") or 0) < -10 else "中性", "value_score": x.get("value_score"), "trust_score": x.get("trust_score"), "reason": x.get("reasons")} for x in news_top]
+    sector_map = {x.get("industry"): x for x in sectors}
+    flow_frame = pd.DataFrame(flows)
+    market_flow_series = []
+    rotation_timeline = []
+    if not flow_frame.empty:
+        flow_frame["net_mf_yi"] = pd.to_numeric(flow_frame["net_mf_yi"], errors="coerce")
+        for date, group in flow_frame.groupby(flow_frame["trade_date"].astype(str), sort=True):
+            group = group.dropna(subset=["net_mf_yi"])
+            if group.empty:
+                continue
+            total = float(group["net_mf_yi"].sum())
+            top_day_in = group.sort_values("net_mf_yi", ascending=False).iloc[0]
+            top_day_out = group.sort_values("net_mf_yi", ascending=True).iloc[0]
+            lead = sector_map.get(top_day_in["industry"], {})
+            lead_ret = float(lead.get("week_ret") or 0)
+            lead_flow = float(top_day_in["net_mf_yi"])
+            stage = "启动" if lead_flow > 0 and lead_ret <= 2 else "加速" if lead_flow > 0 and lead_ret > 2 else "分歧" if lead_flow < 0 and lead_ret > 0 else "退潮" if lead_flow < 0 and lead_ret < 0 else "观察"
+            market_flow_series.append({"trade_date": date, "net_mf_yi": round(total, 2)})
+            rotation_timeline.append({"trade_date": date, "stage": stage, "inflow_sector": top_day_in["industry"], "inflow_yi": round(lead_flow, 2), "outflow_sector": top_day_out["industry"], "outflow_yi": round(float(top_day_out["net_mf_yi"]), 2), "confidence": "中" if len(group) >= 20 else "低"})
     summary = {
         "stock_count": len(stocks),
         "sector_count": len(sectors),
@@ -183,16 +221,25 @@ def build():
         "etf_count": len(etfs),
         "etf_window": sorted({str(x.get("trade_date")) for x in etfs if x.get("trade_date")}),
         "market_state": market_state,
+        "conclusion": conclusion,
         "strategy": strategy,
         "avoid_strategy": "不追逐高位无资金承接的涨幅，不把估算身份当作真实账户归属",
         "main_conflict": main_conflict,
         "primary_reason": "上涨宽度、五日主力资金、涨停/炸板结构与板块相对强弱的规则合成",
+        "reason_blocks": reason_blocks,
         "strongest_sector": strongest.get("industry"),
         "strongest_sector_score": strongest.get("strength"),
+        "strongest_sector_reason": "涨幅、资金、上涨家数和持续性综合得分最高",
         "trade_sector": trade_sector.get("industry"),
         "trade_sector_reason": "优先观察有资金承接且上涨宽度较好的方向，仍需下一交易日验证",
         "position": round(min(80, max(20, money_effect * 0.7)), 0),
         "confidence": "中",
+        "validation": f"验证点：观察 {lead_in or '最强承接方向'} 次日是否继续净流入，并确认龙头、中军与板块同步。",
+        "invalidation": "失效条件：资金广度转负、最强板块跌破前一交易日低点，或利好方向出现放量冲高回落。",
+        "news_briefs": news_briefs,
+        "market_flow_series": market_flow_series,
+        "rotation_timeline": rotation_timeline,
+        "flow_periods": [{"period": "5分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "15分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "30分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "当日", "available": bool(market_flow_series), "reason": "按板块日级主力净流合计"}, {"period": "3日", "available": len(market_flow_series) >= 3, "reason": "按最近可用交易日合计"}, {"period": "5日", "available": len(market_flow_series) >= 5, "reason": "按最近可用交易日合计"}, {"period": "20日", "available": False, "reason": "当前快照不足20个交易日资金明细"}],
         "proxy_funds": proxy_funds,
         "proxy_links": proxy_links,
         "rotation_paths": rotation_paths,
