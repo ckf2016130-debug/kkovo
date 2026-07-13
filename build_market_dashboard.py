@@ -225,6 +225,17 @@ def load_data():
 
 def build():
     sectors, stocks, flows, prices, etfs, overseas, stock_flows = load_data()
+    index_rows = []
+    for path in sorted((ROOT / "data").glob("index_daily_*.csv")):
+        try:
+            frame = pd.read_csv(path)
+            if {"trade_date", "close"}.issubset(frame.columns):
+                if "ts_code" not in frame:
+                    frame["ts_code"] = path.stem.replace("index_daily_", "").replace("_", ".")
+                index_rows.append(frame[[c for c in ["ts_code", "trade_date", "close", "pct_chg", "amount"] if c in frame]])
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+            continue
+    index_frame = pd.concat(index_rows, ignore_index=True) if index_rows else pd.DataFrame()
     news_path = ROOT / "data" / "news" / "news_scored.csv"
     news = records(pd.read_csv(news_path)) if news_path.exists() else []
     numeric_stocks = pd.to_numeric(pd.Series([x.get("week_ret") for x in stocks]), errors="coerce").dropna()
@@ -258,12 +269,64 @@ def build():
     money_effect = min(100, max(0, (breadth or 0) * 0.65 + (positive_flow or 0) * 0.20 + min(limit_up, 100) * 0.15))
     mean_ret = float(numeric_stocks.mean()) if not numeric_stocks.empty else 0
     total_stock_flow = float(flow.sum(min_count=1)) if not flow.dropna().empty else None
-    if breadth is not None and breadth >= 65 and mean_ret > 0 and (positive_flow or 0) >= 55 and (total_stock_flow or 0) > 0:
+    market_amount_ratio = None
+    if prices:
+        price_frame = pd.DataFrame(prices)
+        price_frame["amount"] = pd.to_numeric(price_frame.get("amount"), errors="coerce")
+        daily_amount = price_frame.groupby(price_frame["trade_date"].astype(str))["amount"].sum().sort_index().dropna()
+        if len(daily_amount) >= 3 and daily_amount.iloc[:-1].median() > 0:
+            market_amount_ratio = float(daily_amount.iloc[-1] / daily_amount.iloc[:-1].median())
+    index_week_ret = None
+    index_day_ret = None
+    index_evidence = []
+    if not index_frame.empty:
+        index_frame["close"] = pd.to_numeric(index_frame["close"], errors="coerce")
+        index_frame["pct_chg"] = pd.to_numeric(index_frame.get("pct_chg"), errors="coerce")
+        for code, group in index_frame.dropna(subset=["close"]).groupby("ts_code"):
+            group = group.sort_values("trade_date")
+            if len(group) >= 2:
+                index_week_ret = float((group["close"].iloc[-1] / group["close"].iloc[max(0, len(group)-5)] - 1) * 100) if index_week_ret is None else index_week_ret
+                index_evidence.append(f"{code}近5日 {index_week_ret:.2f}%")
+                if index_day_ret is None and pd.notna(group["pct_chg"].iloc[-1]):
+                    index_day_ret = float(group["pct_chg"].iloc[-1])
+    defensive_terms = ("银行", "保险", "公用事业", "煤炭", "石油", "医药", "食品饮料")
+    growth_terms = ("半导体", "电子", "计算机", "通信", "军工", "新能源", "软件")
+    def style_flow(terms):
+        rows = [x for x in sectors if any(term in str(x.get("industry") or "") for term in terms)]
+        return sum(float(x.get("net_mf_yi") or 0) for x in rows), sum(float(x.get("week_ret") or 0) for x in rows), len(rows)
+    defensive_flow, defensive_ret, defensive_count = style_flow(defensive_terms)
+    growth_flow, growth_ret, growth_count = style_flow(growth_terms)
+    state_evidence = []
+    if index_week_ret is not None:
+        state_evidence.append(f"指数近5日代表值 {index_week_ret:.2f}%")
+    if market_amount_ratio is not None:
+        state_evidence.append(f"最新市场成交额/前期中位 {market_amount_ratio:.2f}倍")
+    if index_week_ret is not None and breadth is not None and index_week_ret - mean_ret >= 1.0 and breadth < 50:
+        market_state, strategy = "指数强个股弱", "指数权重不代表个股机会，降低追涨，等待个股宽度和资金同步改善"
+        state_evidence.append("指数涨幅明显高于个股等权涨幅且上涨宽度低于50%")
+    elif index_week_ret is not None and breadth is not None and mean_ret - index_week_ret >= 1.0 and breadth >= 50:
+        market_state, strategy = "指数弱个股强", "只做有宽度和资金承接的局部方向，避免把指数弱误读为全面风险"
+        state_evidence.append("个股等权涨幅明显高于代表指数且上涨宽度不弱")
+    elif defensive_count and defensive_flow > max(growth_flow, 0) * 1.25 and defensive_ret >= growth_ret:
+        market_state, strategy = "防御占优", "优先观察低波动和现金流方向，成长板块等待资金重新确认"
+        state_evidence.append(f"防御候选板块资金 {defensive_flow:.2f}亿，高于成长候选 {growth_flow:.2f}亿")
+    elif growth_count and growth_flow > max(defensive_flow, 0) * 1.25 and growth_ret >= defensive_ret:
+        market_state, strategy = "成长占优", "只跟踪有业绩或订单验证的成长方向，警惕高估值拥挤"
+        state_evidence.append(f"成长候选板块资金 {growth_flow:.2f}亿，高于防御候选 {defensive_flow:.2f}亿")
+    elif breadth is not None and breadth <= 20 and mean_ret < -2 and (total_stock_flow or 0) < 0:
+        market_state, strategy = "恐慌释放", "降低仓位，等待跌停/炸板结构和资金广度止跌后再观察修复"
+        state_evidence.append("上涨宽度极低、平均跌幅超过2%且资金流出")
+    elif breadth is not None and breadth >= 65 and mean_ret > 0 and (positive_flow or 0) >= 55 and (total_stock_flow or 0) > 0:
         market_state, strategy = "增量上涨", "顺势跟随主线，但只做有资金和龙头验证的方向"
     elif breadth is not None and breadth >= 55 and mean_ret > 0 and (total_stock_flow or 0) <= 0:
         market_state, strategy = "缩量上涨", "控制追高，优先观察低位承接和回流确认"
     elif breadth is not None and breadth <= 35 and mean_ret < 0 and (total_stock_flow or 0) < 0:
-        market_state, strategy = "放量下跌", "降低仓位，等待风险释放后再看修复"
+        if market_amount_ratio is not None and market_amount_ratio >= 1.15:
+            market_state, strategy = "放量下跌", "降低仓位，等待风险释放后再看修复"
+        elif market_amount_ratio is not None and market_amount_ratio < 0.85:
+            market_state, strategy = "缩量下跌", "不急于抄底，等待成交额和上涨宽度同时止跌"
+        else:
+            market_state, strategy = "情绪退潮", "以防守和等待为主，不接力弱势反弹"
     elif breadth is not None and breadth <= 35 and mean_ret < 0:
         market_state, strategy = "情绪退潮", "以防守和等待为主，不接力弱势反弹"
     elif mean_ret > 0 and (positive_flow or 0) < 50:
@@ -272,6 +335,8 @@ def build():
         market_state, strategy = "普涨修复", "可跟踪修复主线，但需要成交额和资金继续确认"
     else:
         market_state, strategy = "高位分歧", "控制总仓位，等待强弱方向和资金流向重新收敛"
+    if not state_evidence:
+        state_evidence.append("暂无足够指数或成交额基准，状态仅由个股宽度、资金和涨跌结构合成")
     stocks_frame = pd.DataFrame(stocks)
     for col in ["circ_mv_yi", "turnover_rate", "net_mf_5d_yi", "U", "Z", "week_ret"]:
         stocks_frame[col] = pd.to_numeric(stocks_frame.get(col), errors="coerce")
