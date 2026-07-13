@@ -17,6 +17,28 @@ def load_etfs():
     basic_path = ROOT / "data" / "etf_basic.csv"
     if not basic_path.exists():
         return []
+
+
+def load_overseas():
+    path = ROOT / "data" / "overseas_daily.csv"
+    if not path.exists():
+        return []
+    try:
+        frame = pd.read_csv(path)
+        frame["trade_date"] = frame["trade_date"].astype(str)
+        frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+        frame = frame.dropna(subset=["asset", "trade_date", "close"]).sort_values(["asset", "trade_date"])
+        rows = []
+        for (asset, group), part in frame.groupby(["asset", "group"], sort=False):
+            part = part.tail(60).copy()
+            close = part["close"]
+            row = {"asset": asset, "group": group, "trade_date": part["trade_date"].iloc[-1], "close": float(close.iloc[-1])}
+            for days, key in [(5, "ret_5d"), (20, "ret_20d"), (60, "ret_60d")]:
+                row[key] = float((close.iloc[-1] / close.iloc[-min(days, len(close))] - 1) * 100) if len(close) > 1 else None
+            rows.append(row)
+        return rows
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
+        return []
     try:
         basic = pd.read_csv(basic_path)
         paths = sorted((ROOT / "data").glob("etf_daily_*.csv"))
@@ -97,6 +119,7 @@ def load_data():
             pass
     price = pd.concat(prices, ignore_index=True).drop_duplicates(["ts_code", "trade_date"]) if prices else pd.DataFrame()
     etfs = load_etfs()
+    overseas = load_overseas()
     stock_flows = []
     for path in sorted((ROOT / "data").glob("moneyflow_*.csv")):
         try:
@@ -117,12 +140,13 @@ def load_data():
         records(sector_flow[["industry", "trade_date", "net_mf_yi"]]),
         records(price) if not price.empty else [],
         etfs,
+        overseas,
         records(stock_flows),
     )
 
 
 def build():
-    sectors, stocks, flows, prices, etfs, stock_flows = load_data()
+    sectors, stocks, flows, prices, etfs, overseas, stock_flows = load_data()
     news_path = ROOT / "data" / "news" / "news_scored.csv"
     news = records(pd.read_csv(news_path)) if news_path.exists() else []
     numeric_stocks = pd.to_numeric(pd.Series([x.get("week_ret") for x in stocks]), errors="coerce").dropna()
@@ -273,6 +297,51 @@ def build():
         news_briefs.append({"title": item.get("title"), "url": item.get("url"), "time": item.get("time"), "industry": industry, "name": affected_stock, "direction": direction, "value_score": item.get("value_score"), "trust_score": item.get("trust_score"), "reason": item.get("reasons"), **impact})
     chain_head = news_briefs[0] if news_briefs else None
     logic_chain = [{"label": "国内消息", "value": chain_head.get("title") if chain_head else "暂无高价值消息", "evidence": f"时间 {chain_head.get('time')} · 价值 {chain_head.get('value_score')} · 可信度 {chain_head.get('trust_score')}" if chain_head else "暂无真实消息"}, {"label": "影响对象", "value": chain_head.get("industry") if chain_head else "未映射", "evidence": chain_head.get("impact_type") if chain_head else "暂无证据"}, {"label": "资金验证", "value": lead_in or "暂无承接方向", "evidence": f"板块5日净流 {float(sector_map.get(lead_in, {}).get('net_mf_yi') or 0):.2f}亿" if lead_in else "暂无数据"}, {"label": "价格验证", "value": market_state, "evidence": f"个股等权 {mean_ret:.2f}% · 上涨宽度 {breadth:.1f}%" if breadth is not None else "暂无数据"}, {"label": "判断", "value": "相关但尚不能确认主要因果" if not chain_head or chain_head.get("market_acceptance") != "价格与资金初步认可" else "价格与资金初步认可", "evidence": "时间相关性不等于因果，需下一交易日复核"}]
+    overseas_conduction = []
+    price_frame = pd.DataFrame(prices)
+    if not price_frame.empty and "pct_chg" in price_frame:
+        price_frame["pct_chg"] = pd.to_numeric(price_frame["pct_chg"], errors="coerce")
+        a_market = price_frame.groupby(price_frame["trade_date"].astype(str))["pct_chg"].mean().dropna()
+    else:
+        a_market = pd.Series(dtype=float)
+    sector_keywords = {
+        "费城半导体": ["半导体", "电子设备", "元件"],
+        "中国台湾加权": ["半导体", "电子设备", "元件"],
+        "韩国综合": ["半导体", "电子设备", "元件"],
+        "日经225": ["汽车", "家用电器", "电子设备"],
+        "纳斯达克": ["软件服务", "互联网", "半导体", "电子设备"],
+        "标普500": [],
+        "道琼斯": [],
+    }
+    for item in overseas:
+        asset = item.get("asset")
+        targets = [s for s in sectors if any(k in str(s.get("industry")) for k in sector_keywords.get(asset, []))]
+        target_ret = float(pd.to_numeric(pd.Series([s.get("week_ret") for s in targets]), errors="coerce").mean()) if targets else None
+        same_corr = lead_corr = None
+        try:
+            hist = pd.read_csv(ROOT / "data" / "overseas_daily.csv")
+            hist = hist[hist["asset"] == asset].copy()
+            hist["trade_date"] = hist["trade_date"].astype(str)
+            hist["close"] = pd.to_numeric(hist["close"], errors="coerce")
+            hist_ret = hist.sort_values("trade_date").set_index("trade_date")["close"].pct_change()
+            joined = pd.concat([hist_ret.rename("overseas"), a_market.rename("a_market")], axis=1).dropna().tail(60)
+            if len(joined) >= 5:
+                same_corr = float(joined["overseas"].corr(joined["a_market"]))
+                lead_corr = float(joined["overseas"].shift(1).corr(joined["a_market"]))
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
+            pass
+        ret5 = item.get("ret_5d")
+        if target_ret is None:
+            state = "仅有海外价格，暂无对应A股板块验证"
+        elif ret5 is not None and ret5 < 0 and target_ret < 0:
+            state = "海外变量正常传导"
+        elif ret5 is not None and ret5 < 0 and target_ret >= 0:
+            state = "A股暂时吸收或走独立行情"
+        elif ret5 is not None and ret5 > 0 and target_ret <= 0:
+            state = "海外利好暂未获A股认可"
+        else:
+            state = "海外与A股方向暂时一致"
+        overseas_conduction.append({"asset": asset, "group": item.get("group"), "ret_5d": ret5, "ret_20d": item.get("ret_20d"), "ret_60d": item.get("ret_60d"), "targets": [s.get("industry") for s in targets[:5]], "target_ret": target_ret, "same_corr_60": same_corr, "lead_corr_60": lead_corr, "state": state, "confidence": "中" if targets and same_corr is not None else "低"})
     flow_frame = pd.DataFrame(flows)
     market_flow_series = []
     rotation_timeline = []
@@ -351,6 +420,7 @@ def build():
         "market_flow_series": market_flow_series,
         "rotation_timeline": rotation_timeline,
         "changes": changes,
+        "overseas_conduction": overseas_conduction,
         "flow_periods": [{"period": "5分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "15分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "30分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "当日", "available": bool(market_flow_series), "reason": "按板块日级主力净流合计"}, {"period": "3日", "available": len(market_flow_series) >= 3, "reason": "按最近可用交易日合计"}, {"period": "5日", "available": len(market_flow_series) >= 5, "reason": "按最近可用交易日合计"}, {"period": "20日", "available": False, "reason": "当前快照不足20个交易日资金明细"}],
         "proxy_funds": proxy_funds,
         "agent_series": agent_series,

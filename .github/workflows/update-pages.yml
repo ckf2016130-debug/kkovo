@@ -46,6 +46,9 @@ jobs:
           TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
         run: python fetch_tinyshare_week.py
 
+      - name: Fetch overseas market data
+        run: python fetch_overseas.py || echo "Overseas source timeout or failure; previous snapshot will be used"
+
       - name: Build rotation and fundamental metrics
         run: python build_rotation_report.py
 
