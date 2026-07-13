@@ -97,6 +97,17 @@ def load_data():
             pass
     price = pd.concat(prices, ignore_index=True).drop_duplicates(["ts_code", "trade_date"]) if prices else pd.DataFrame()
     etfs = load_etfs()
+    stock_flows = []
+    for path in sorted((ROOT / "data").glob("moneyflow_*.csv")):
+        try:
+            frame = pd.read_csv(path)
+            if {"ts_code", "trade_date", "net_mf_amount"}.issubset(frame.columns):
+                frame = frame[["ts_code", "trade_date", "net_mf_amount"]].copy()
+                frame["net_mf_yi"] = pd.to_numeric(frame["net_mf_amount"], errors="coerce") / 100000
+                stock_flows.append(frame[["ts_code", "trade_date", "net_mf_yi"]])
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+            continue
+    stock_flows = pd.concat(stock_flows, ignore_index=True) if stock_flows else pd.DataFrame(columns=["ts_code", "trade_date", "net_mf_yi"])
 
     sector_cols = ["rank", "industry", "state", "constituents", "week_ret", "median_ret", "net_mf_yi", "fri_flow_yi", "breadth", "turnover_yi", "flow_ratio", "limit_up", "broken", "limit_down", "strength"]
     stock_cols = ["industry", "name", "ts_code", "market", "week_ret", "fri_ret", "net_mf_5d_yi", "net_mf_fri_yi", "circ_mv_yi", "turnover_yi", "turnover_rate", "pe", "pb", "U", "Z", "D", "leader_score", "core_score", "elastic_score", "ann_date", "eps", "bps", "fcfe_ps", "roe", "grossprofit_margin", "netprofit_margin", "debt_to_assets", "current_ratio", "q_ocf_to_sales", "q_sales_yoy", "netprofit_yoy", "ocf_yoy", "quality_score", "growth_score", "cash_score", "leverage_score", "valuation_score", "fundamental_coverage", "fundamental_score"]
@@ -106,11 +117,12 @@ def load_data():
         records(sector_flow[["industry", "trade_date", "net_mf_yi"]]),
         records(price) if not price.empty else [],
         etfs,
+        records(stock_flows),
     )
 
 
 def build():
-    sectors, stocks, flows, prices, etfs = load_data()
+    sectors, stocks, flows, prices, etfs, stock_flows = load_data()
     news_path = ROOT / "data" / "news" / "news_scored.csv"
     news = records(pd.read_csv(news_path)) if news_path.exists() else []
     numeric_stocks = pd.to_numeric(pd.Series([x.get("week_ret") for x in stocks]), errors="coerce").dropna()
@@ -158,8 +170,8 @@ def build():
     cap_mid = stocks_frame["circ_mv_yi"].median()
     turn_mid = stocks_frame["turnover_rate"].median()
     proxy_specs = [
-        ("国家队代理", (stocks_frame["circ_mv_yi"] >= cap_mid) & (stocks_frame["net_mf_5d_yi"] > 0), "大市值与权重股资金承接"),
-        ("机构代理", (stocks_frame["circ_mv_yi"] >= cap_mid) & (stocks_frame["turnover_rate"] <= turn_mid) & (stocks_frame["net_mf_5d_yi"] > 0), "大市值、低换手、持续净流入"),
+        ("国家队代理", stocks_frame["circ_mv_yi"] >= cap_mid, "大市值与权重股的资金方向"),
+        ("机构代理", (stocks_frame["circ_mv_yi"] >= cap_mid) & (stocks_frame["turnover_rate"] <= turn_mid), "大市值、低换手、持续交易方向"),
         ("游资代理", (stocks_frame["U"].fillna(0) + stocks_frame["Z"].fillna(0) > 0) & (stocks_frame["turnover_rate"] >= turn_mid), "涨停/炸板与高换手行为"),
         ("散户代理", (stocks_frame["circ_mv_yi"] < cap_mid) & (stocks_frame["turnover_rate"] >= turn_mid), "小市值与高换手行为"),
     ]
@@ -186,8 +198,8 @@ def build():
             merged = mf.merge(stock_class, on="ts_code", how="inner").dropna(subset=["net_mf_amount"])
             net = merged["net_mf_amount"]
             masks = {
-                "国家队代理": (merged["circ_mv_yi"] >= cap_mid) & (net > 0),
-                "机构代理": (merged["circ_mv_yi"] >= cap_mid) & (merged["turnover_rate"] <= turn_mid) & (net > 0),
+                "国家队代理": merged["circ_mv_yi"] >= cap_mid,
+                "机构代理": (merged["circ_mv_yi"] >= cap_mid) & (merged["turnover_rate"] <= turn_mid),
                 "游资代理": (merged["U"].fillna(0) + merged["Z"].fillna(0) > 0) & (merged["turnover_rate"] >= turn_mid),
                 "散户代理": (merged["circ_mv_yi"] < cap_mid) & (merged["turnover_rate"] >= turn_mid),
             }
@@ -197,13 +209,27 @@ def build():
                 agent_series.append({"trade_date": date, "name": name, "value": round(value, 2) if value is not None else None})
         except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
             continue
+    flow_values = pd.to_numeric(pd.Series([x.get("net_mf_yi") for x in sectors]), errors="coerce")
+    flow_rank = flow_values.rank(pct=True).fillna(0.5) * 100
+    for sector, rank in zip(sectors, flow_rank.tolist()):
+        breadth_score = float(sector.get("breadth") or 0)
+        ret = float(sector.get("week_ret") or 0)
+        crowding_penalty = min(35, max(0, ret) * 4)
+        sector["trade_value_score"] = round(max(0, min(100, breadth_score * 0.45 + rank * 0.35 + (100 - crowding_penalty) * 0.20)), 1)
+        sector["trade_value_reason"] = "资金与上涨宽度同步，且短期涨幅未明显拥挤" if crowding_penalty < 20 else "资金仍在，但短期涨幅较高，追高风险上升"
     top_in = sorted(sectors, key=lambda x: float(x.get("net_mf_yi") or 0), reverse=True)[:3]
     top_out = sorted(sectors, key=lambda x: float(x.get("net_mf_yi") or 0))[:3]
-    proxy_links = [{"source": p["name"], "target": s.get("industry"), "value": abs(float(p["value"] or 0)) / max(len(top_in), 1)} for p in proxy_funds for s in top_in if (p["value"] or 0) > 0]
+    proxy_links = []
+    for sector in sorted(sectors, key=lambda x: float(x.get("net_mf_yi") or 0), reverse=True)[:12]:
+        for agent in sector.get("agent_flows", []):
+            value = float(agent.get("value") or 0)
+            if value > 0:
+                proxy_links.append({"source": agent["name"], "target": sector.get("industry"), "value": round(value, 2)})
+    proxy_links = sorted(proxy_links, key=lambda x: x["value"], reverse=True)[:16]
     rotation_paths = [{"from": s.get("industry"), "to": t.get("industry"), "value": round(min(abs(float(s.get("net_mf_yi") or 0)), abs(float(t.get("net_mf_yi") or 0))), 2), "confidence": "中"} for s, t in zip(top_out, top_in)]
     strongest = max(sectors, key=lambda x: float(x.get("strength") or 0), default={})
     rotation_candidates = [x for x in sectors if x.get("state") == "潜在轮入"]
-    trade_sector = max(rotation_candidates or sectors, key=lambda x: float(x.get("breadth") or 0) + max(float(x.get("net_mf_yi") or 0), 0) / 100, default={})
+    trade_sector = max(rotation_candidates or sectors, key=lambda x: float(x.get("trade_value_score") or 0), default={})
     if mean_ret > 0 and (positive_flow or 0) < 50:
         main_conflict = "指数和个股表现改善，但资金广度不足，仍是存量轮动而非全面增量"
     elif (breadth or 0) < 40 and (positive_flow or 0) < 45:
@@ -242,14 +268,36 @@ def build():
         if not affected_stock and industry in stocks_frame.get("industry", pd.Series(dtype=str)).values:
             candidates = stocks_frame[stocks_frame["industry"] == industry].sort_values("leader_score", ascending=False)
             affected_stock = candidates.iloc[0].get("name") if not candidates.empty else None
-        news_briefs.append({"title": item.get("title"), "url": item.get("url"), "time": item.get("time"), "industry": industry, "name": affected_stock, "direction": direction, "value_score": item.get("value_score"), "trust_score": item.get("trust_score"), "reason": item.get("reasons"), "impact_type": "直接影响" if direct else "间接映射", "impact_scope": "个股+所属板块" if direct else "板块观察", "consumption": "当前快照无法确认，需结合消息前后价格" if sector else "暂无可验证价格窗口", "market_acceptance": acceptance, "sector_ret": sector_ret, "sector_flow": sector_flow, "validation": f"验证：{industry}次日资金与龙头/中军是否同步。" if sector else "验证：先补充可映射的板块或标的。"})
+        impact = {"impact_type": "直接影响" if direct else "间接映射", "impact_scope": "个股+所属板块" if direct else "板块观察", "consumption": "当前快照无法确认，需结合消息前后价格" if sector else "暂无可验证价格窗口", "market_acceptance": acceptance, "sector_ret": sector_ret, "sector_flow": sector_flow, "validation": f"验证：{industry}次日资金与龙头/中军是否同步。" if sector else "验证：先补充可映射的板块或标的。", "affected_stock": affected_stock}
+        item.update(impact)
+        news_briefs.append({"title": item.get("title"), "url": item.get("url"), "time": item.get("time"), "industry": industry, "name": affected_stock, "direction": direction, "value_score": item.get("value_score"), "trust_score": item.get("trust_score"), "reason": item.get("reasons"), **impact})
     chain_head = news_briefs[0] if news_briefs else None
     logic_chain = [{"label": "国内消息", "value": chain_head.get("title") if chain_head else "暂无高价值消息", "evidence": f"时间 {chain_head.get('time')} · 价值 {chain_head.get('value_score')} · 可信度 {chain_head.get('trust_score')}" if chain_head else "暂无真实消息"}, {"label": "影响对象", "value": chain_head.get("industry") if chain_head else "未映射", "evidence": chain_head.get("impact_type") if chain_head else "暂无证据"}, {"label": "资金验证", "value": lead_in or "暂无承接方向", "evidence": f"板块5日净流 {float(sector_map.get(lead_in, {}).get('net_mf_yi') or 0):.2f}亿" if lead_in else "暂无数据"}, {"label": "价格验证", "value": market_state, "evidence": f"个股等权 {mean_ret:.2f}% · 上涨宽度 {breadth:.1f}%" if breadth is not None else "暂无数据"}, {"label": "判断", "value": "相关但尚不能确认主要因果" if not chain_head or chain_head.get("market_acceptance") != "价格与资金初步认可" else "价格与资金初步认可", "evidence": "时间相关性不等于因果，需下一交易日复核"}]
     flow_frame = pd.DataFrame(flows)
     market_flow_series = []
     rotation_timeline = []
+    changes = []
     if not flow_frame.empty:
         flow_frame["net_mf_yi"] = pd.to_numeric(flow_frame["net_mf_yi"], errors="coerce")
+        dates_available = sorted(flow_frame["trade_date"].astype(str).unique())
+        if len(dates_available) >= 2:
+            latest_date, previous_date = dates_available[-1], dates_available[-2]
+            latest = flow_frame[flow_frame["trade_date"].astype(str) == latest_date].set_index("industry")["net_mf_yi"]
+            previous = flow_frame[flow_frame["trade_date"].astype(str) == previous_date].set_index("industry")["net_mf_yi"]
+            for industry in set(latest.index) | set(previous.index):
+                before = float(previous.get(industry, 0) or 0)
+                after = float(latest.get(industry, 0) or 0)
+                if (before < 0 <= after) or (before > 0 >= after) or abs(after - before) >= 30:
+                    changes.append({
+                        "time": latest_date,
+                        "title": f"{industry}资金由{'流出转为流入' if before < 0 <= after else '流入转为流出' if before > 0 >= after else '快速变化'}",
+                        "before": round(before, 2),
+                        "after": round(after, 2),
+                        "meaning": "关注回流是否由龙头和中军共同确认" if after > before else "警惕冲高兑现和板块内部扩散变弱",
+                        "confidence": "中" if abs(after - before) >= 60 else "低",
+                        "validation": "下一交易日观察资金方向与板块涨跌是否同步",
+                    })
+            changes = sorted(changes, key=lambda x: abs(x["after"] - x["before"]), reverse=True)[:6]
         for date, group in flow_frame.groupby(flow_frame["trade_date"].astype(str), sort=True):
             group = group.dropna(subset=["net_mf_yi"])
             if group.empty:
@@ -290,9 +338,10 @@ def build():
         "reason_blocks": reason_blocks,
         "strongest_sector": strongest.get("industry"),
         "strongest_sector_score": strongest.get("strength"),
-        "strongest_sector_reason": "涨幅、资金、上涨家数和持续性综合得分最高",
+        "strongest_sector_reason": f"强度 {float(strongest.get('strength') or 0):.1f}/100：涨幅、资金、上涨家数和持续性综合得分最高",
         "trade_sector": trade_sector.get("industry"),
-        "trade_sector_reason": "优先观察有资金承接且上涨宽度较好的方向，仍需下一交易日验证",
+        "trade_sector_score": trade_sector.get("trade_value_score"),
+        "trade_sector_reason": f"交易价值 {float(trade_sector.get('trade_value_score') or 0):.1f}/100：{trade_sector.get('trade_value_reason', '优先观察有资金承接且上涨宽度较好的方向')}；仍需下一交易日验证",
         "position": round(min(80, max(20, money_effect * 0.7)), 0),
         "confidence": "中",
         "validation": f"验证点：观察 {lead_in or '最强承接方向'} 次日是否继续净流入，并确认龙头、中军与板块同步。",
@@ -301,6 +350,7 @@ def build():
         "logic_chain": logic_chain,
         "market_flow_series": market_flow_series,
         "rotation_timeline": rotation_timeline,
+        "changes": changes,
         "flow_periods": [{"period": "5分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "15分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "30分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "当日", "available": bool(market_flow_series), "reason": "按板块日级主力净流合计"}, {"period": "3日", "available": len(market_flow_series) >= 3, "reason": "按最近可用交易日合计"}, {"period": "5日", "available": len(market_flow_series) >= 5, "reason": "按最近可用交易日合计"}, {"period": "20日", "available": False, "reason": "当前快照不足20个交易日资金明细"}],
         "proxy_funds": proxy_funds,
         "agent_series": agent_series,
@@ -316,6 +366,7 @@ def build():
         "__SUMMARY__": json.dumps(summary, ensure_ascii=False, separators=(",", ":")),
         "__NEWS__": json.dumps(news, ensure_ascii=False, separators=(",", ":")),
         "__ETFS__": json.dumps(etfs, ensure_ascii=False, separators=(",", ":")),
+        "__STOCK_FLOWS__": json.dumps(stock_flows, ensure_ascii=False, separators=(",", ":")),
     }
     for key, value in replacements.items():
         template = template.replace(key, value)
