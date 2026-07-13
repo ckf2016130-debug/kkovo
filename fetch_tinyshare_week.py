@@ -15,6 +15,11 @@ def fetch(pro, api_name, filename, **kwargs):
     path = OUT / filename
     try:
         df = pro.query(api_name, **kwargs)
+        if df.empty:
+            if path.exists() and path.stat().st_size > 0:
+                print(f"EMPTY {api_name}: keep previous snapshot at {path}")
+                return {"api": api_name, "rows": 0, "file": str(path), "error": "empty response; previous snapshot kept"}
+            raise ValueError("empty response and no previous snapshot")
         df.to_csv(path, index=False, encoding="utf-8-sig")
         print(f"OK {api_name}: {len(df):,} rows -> {path}")
         return {"api": api_name, "rows": len(df), "file": str(path), "error": None}

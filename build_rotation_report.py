@@ -27,9 +27,18 @@ def esc(v):
     return html.escape(str(v))
 
 
+def usable_csv(path):
+    try:
+        return path.exists() and path.stat().st_size > 20 and not pd.read_csv(path, nrows=1).empty
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+        return False
+
+
 def load():
     global DATES
-    DATES = sorted(path.stem.split("_")[-1] for path in DATA.glob("daily_*.csv") if path.stem.split("_")[-1].isdigit())[-5:]
+    candidates = sorted(path.stem.split("_")[-1] for path in DATA.glob("daily_*.csv") if path.stem.split("_")[-1].isdigit())
+    valid_dates = [d for d in candidates if all(usable_csv(DATA / f"{prefix}_{d}.csv") for prefix in ["daily", "daily_basic", "moneyflow", "limit_list"])]
+    DATES = valid_dates[-5:]
     if len(DATES) < 2:
         raise RuntimeError("可用交易日数据不足，至少需要两个交易日")
     basic = pd.read_csv(DATA / "stock_basic.csv", dtype={"symbol": str, "list_date": str})
