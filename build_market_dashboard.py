@@ -200,6 +200,12 @@ def build():
     news = records(pd.read_csv(news_path)) if news_path.exists() else []
     numeric_stocks = pd.to_numeric(pd.Series([x.get("week_ret") for x in stocks]), errors="coerce").dropna()
     generated_at = pd.Timestamp.now(tz="Asia/Shanghai").isoformat(timespec="seconds")
+    history_path = ROOT / "data" / "decision_history.json"
+    try:
+        decision_history = json.loads(history_path.read_text(encoding="utf-8")) if history_path.exists() else []
+        decision_history = decision_history if isinstance(decision_history, list) else []
+    except (OSError, json.JSONDecodeError):
+        decision_history = []
     pe = pd.to_numeric(pd.Series([x.get("pe") for x in stocks]), errors="coerce")
     pe = pe[(pe > 0) & (pe < 300)].dropna()
     median_pe = float(pe.median()) if not pe.empty else None
@@ -485,6 +491,25 @@ def build():
         "proxy_links": proxy_links,
         "rotation_paths": rotation_paths,
     }
+    previous = decision_history[-1] if decision_history else None
+    latest_trade_date = max([str(x.get("trade_date")) for x in prices if x.get("trade_date")], default=None)
+    if previous:
+        state_changed = previous.get("market_state") != market_state
+        sector_continued = previous.get("trade_sector") == trade_sector.get("industry") and bool(trade_sector.get("industry"))
+        flow_direction_now = "正" if (total_stock_flow or 0) > 0 else "负" if (total_stock_flow or 0) < 0 else "未知"
+        flow_direction_before = previous.get("flow_direction")
+        review_status = "判断变化，需重新确认" if state_changed else "方向延续，等待下一交易日验证"
+        if sector_continued and flow_direction_before == flow_direction_now:
+            review_status = "初步验证成立，方向与资金状态延续"
+        review = {"status": review_status, "previous_time": previous.get("generated_at"), "previous_trade_date": previous.get("trade_date"), "previous_state": previous.get("market_state"), "current_state": market_state, "state_changed": state_changed, "trade_sector_continued": sector_continued, "flow_direction_before": flow_direction_before, "flow_direction_now": flow_direction_now, "previous_breadth": previous.get("breadth"), "current_breadth": breadth, "validation": "下一次更新继续观察交易方向、资金方向和上涨宽度是否同步；仅作复盘记录。"}
+    else:
+        review = {"status": "等待下一次数据后复核", "previous_time": None, "previous_trade_date": None, "previous_state": None, "current_state": market_state, "state_changed": None, "trade_sector_continued": None, "flow_direction_before": None, "flow_direction_now": "正" if (total_stock_flow or 0) > 0 else "负" if (total_stock_flow or 0) < 0 else "未知", "previous_breadth": None, "current_breadth": breadth, "validation": "当前为第一份记录，下一次成功更新后才会产生复核结果。"}
+    summary["review"] = review
+    decision_history.append({"generated_at": generated_at, "trade_date": latest_trade_date, "market_state": market_state, "strongest_sector": strongest.get("industry"), "trade_sector": trade_sector.get("industry"), "flow_direction": review.get("flow_direction_now"), "breadth": breadth})
+    try:
+        history_path.write_text(json.dumps(decision_history[-30:], ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
     template = (ROOT / "market_dashboard_template.html").read_text(encoding="utf-8")
     replacements = {
         "__SECTORS__": json.dumps(sectors, ensure_ascii=False, separators=(",", ":")),
