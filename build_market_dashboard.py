@@ -133,6 +133,41 @@ def load_data():
             pass
     price = pd.concat(prices, ignore_index=True).drop_duplicates(["ts_code", "trade_date"]) if prices else pd.DataFrame()
     etfs = load_etfs()
+    if etfs:
+        # ETF holdings make the table useful for selection: concentration and industry exposure
+        # are derived only when the component snapshot contains real weights.
+        component_rows = []
+        for component_path in sorted((ROOT / "data").glob("etf_*_cons_*.csv")):
+            try:
+                component = pd.read_csv(component_path)
+                if {"ts_code", "con_code"}.issubset(component.columns):
+                    keep = [c for c in ["ts_code", "con_code", "name", "weight"] if c in component.columns]
+                    component_rows.append(component[keep].copy())
+            except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+                continue
+        if component_rows:
+            component = pd.concat(component_rows, ignore_index=True)
+            component["weight"] = pd.to_numeric(component.get("weight"), errors="coerce")
+            stock_lookup = stocks[[c for c in ["ts_code", "name", "industry"] if c in stocks.columns]].drop_duplicates("ts_code")
+            component = component.merge(stock_lookup, left_on="con_code", right_on="ts_code", how="left", suffixes=("", "_stock"))
+            exposure = []
+            for code, group in component.groupby("ts_code", sort=False):
+                weights = group["weight"].dropna()
+                total = float(weights[weights > 0].sum()) if not weights.empty else None
+                ranked = group.sort_values("weight", ascending=False).dropna(subset=["weight"])
+                top10 = float(ranked.head(10)["weight"].sum()) if not ranked.empty else None
+                industry_exposure = []
+                if total and total > 0:
+                    by_industry = ranked[ranked["industry"].notna()].groupby("industry")["weight"].sum().sort_values(ascending=False).head(5)
+                    industry_exposure = [{"industry": str(k), "weight": round(float(v / total * 100), 2)} for k, v in by_industry.items()]
+                top_holdings = [{"name": str(row.get("name") or row.get("name_stock") or row.get("con_code")), "code": str(row.get("con_code")), "weight": round(float(row["weight"]), 2)} for _, row in ranked.head(10).iterrows()]
+                exposure.append({"ts_code": code, "component_count": int(group["con_code"].nunique()), "top10_weight": round(top10, 2) if top10 is not None else None, "weight_coverage": round(total, 2) if total is not None else None, "industry_exposure": industry_exposure, "top_holdings": top_holdings})
+            etf_frame = pd.DataFrame(etfs).merge(pd.DataFrame(exposure), on="ts_code", how="left", suffixes=("", "_derived"))
+            for column in ["component_count", "top10_weight", "weight_coverage", "industry_exposure", "top_holdings"]:
+                derived = f"{column}_derived"
+                if derived in etf_frame:
+                    etf_frame[column] = etf_frame[derived].where(etf_frame[derived].notna(), etf_frame.get(column))
+            etfs = records(etf_frame.drop(columns=[c for c in etf_frame.columns if c.endswith("_derived")], errors="ignore"))
     overseas = load_overseas()
     stock_flows = []
     for path in sorted((ROOT / "data").glob("moneyflow_*.csv")):

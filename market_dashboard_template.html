@@ -88,4 +88,32 @@ function renderBubbles(dayIndex,focus='all',pulse=false){
   proxyChart.clear();proxyChart.setOption({animation:true,animationDuration:900,animationDurationUpdate:1200,animationEasingUpdate:'cubicOut',grid:{left:4,right:4,top:4,bottom:4},xAxis:{min:-.7,max:7.4,show:false},yAxis:{min:-.8,max:7.3,show:false},tooltip:{...tooltip,formatter:p=>`${p.data.name}<br>${p.data.day}<br>主力净流：${fmt(p.data.flow)}亿<br>状态：${p.data.flow>=0?'净流入':'净流出'}`},series:[{type:'scatter',data,coordinateSystem:'cartesian2d',clip:false}]})
 }
 let bubbleStep=0;renderBubbles(0,'all');setInterval(()=>{if(!bubbleDays.length)return;bubbleStep=(bubbleStep+1)%bubbleDays.length;renderBubbles(bubbleStep,bubbleStep%3===0?'in':bubbleStep%3===1?'out':'all',bubbleStep%3===2)},4000);
+function addTrendOverlay(){
+  const p=prices.filter(v=>v.ts_code===selectedStock.ts_code).sort((a,b)=>String(a.trade_date).localeCompare(String(b.trade_date)));
+  if(!p.length)return;
+  const close=p.map(v=>Number(v.close)).filter(Number.isFinite), current=close[close.length-1];
+  const window=p.slice(-20), recentHigh=Math.max(...window.map(v=>Number(v.high)).filter(Number.isFinite)), recentLow=Math.min(...window.map(v=>Number(v.low)).filter(Number.isFinite));
+  const lows=[], highs=[];
+  for(let i=2;i<p.length-2;i++){
+    const lo=Number(p[i].low),hi=Number(p[i].high);
+    if(Number.isFinite(lo)&&[p[i-2],p[i-1],p[i+1],p[i+2]].every(v=>lo<=Number(v.low)))lows.push(lo);
+    if(Number.isFinite(hi)&&[p[i-2],p[i-1],p[i+1],p[i+2]].every(v=>hi>=Number(v.high)))highs.push(hi);
+  }
+  const levels=(values,fallback,ascending)=>[...new Set(values.filter(v=>Number.isFinite(v)).sort((a,b)=>ascending?a-b:b-a).map(v=>Number(v.toFixed(2))))].filter(v=>ascending?v>current:v<current).slice(0,3);
+  const supports=levels(lows,recentLow,false); if(!supports.length&&Number.isFinite(recentLow))supports.push(Number(recentLow.toFixed(2)));
+  const resistances=levels(highs,recentHigh,true); if(!resistances.length&&Number.isFinite(recentHigh))resistances.push(Number(recentHigh.toFixed(2)));
+  const nearestSupport=supports[0],nearestResistance=resistances[0];
+  const tr=p.slice(-15).map(v=>Math.max(Number(v.high)-Number(v.low),Math.abs(Number(v.high)-current),Math.abs(Number(v.low)-current))).filter(Number.isFinite),atr=tr.length?tr.reduce((a,b)=>a+b,0)/tr.length:null;
+  stockChart.setOption({series:[{markLine:{silent:true,symbol:['none','none'],data:[...supports.map((v,i)=>({yAxis:v,name:`支撑${i+1}`})),...resistances.map((v,i)=>({yAxis:v,name:`压力${i+1}`}))],label:{color:C.gold}}}]});
+  const risk=Number.isFinite(nearestSupport)?Math.max(0,current-nearestSupport):null,reward=Number.isFinite(nearestResistance)?Math.max(0,nearestResistance-current):null;
+  const box=document.querySelector('#tradeLevels');
+  if(box)box.innerHTML=`<div class="trade-level-grid"><div><span>当前价</span><b>${fmt(current)}</b></div><div><span>支撑位1 / 2 / 3</span><b>${supports.map(fmt).join(' / ')||'—'}</b></div><div><span>压力位1 / 2 / 3</span><b>${resistances.map(fmt).join(' / ')||'—'}</b></div><div><span>波动参考 ATR(15日)</span><b>${fmt(atr)}</b></div><div><span>最近压力空间</span><b>${reward!=null?fmt(reward/current*100)+'%':'—'}</b></div><div><span>最近支撑风险</span><b>${risk!=null?fmt(risk/current*100)+'%':'—'}</b></div><div><span>最近盈亏比</span><b>${risk?fmt(reward/risk,2):'—'}</b></div></div><small class="source">支撑/压力：近20日局部拐点，按距离当前价最近的三个有效价位列示；不是预测，也不代表必然反转。最近盈亏比=压力1距离÷支撑1距离。</small>`;
+  const coverage=document.querySelector('#priceCoverage');if(coverage)coverage.textContent=`${shortDate(p[0].trade_date)} 至 ${shortDate(p[p.length-1].trade_date)} · ${p.length}个交易日 · 支撑 ${fmt(nearestSupport)} · 压力 ${fmt(nearestResistance)}`;
+}
+addTrendOverlay();
+function renderEtfEvidence(){
+  const box=document.querySelector('#etfBoard');if(!box||!etfs.length)return;
+  box.innerHTML=`<table class="etf-table"><thead><tr><th>名称/代码</th><th>跟踪基准</th><th>窗口涨跌</th><th>成交额(亿)</th><th>成分数</th><th>前十大权重</th><th>行业暴露前五</th><th>申赎替代参考</th></tr></thead><tbody>${etfs.slice(0,8).map(x=>{const exposure=(x.industry_exposure||[]).map(v=>`${escHtml(v.industry)} ${fmt(v.weight,1)}%`).join('、');return `<tr><td>${escHtml(x.name||x.ts_code)}<small>${escHtml(x.ts_code||'')}</small></td><td title="${escHtml(x.benchmark||'')}">${escHtml(x.benchmark||'未提供')}</td><td class="${cls(x.week_ret)}">${fmt(x.week_ret)}%</td><td>${fmt(x.amount_yi)}</td><td>${fmt(x.component_count,0)}</td><td>${fmt(x.top10_weight,1)}%</td><td title="${exposure}">${exposure||'未提供权重'}</td><td>${fmt(x.cpr_mean,2)}</td></tr>`}).join('')}</tbody></table><div class="source">筛选口径：仅展示有真实行情成交额的 ETF；成分数、前十大权重和行业暴露来自最近一次成分快照，缺失时不补零。行情成交额不等于申赎资金，申赎替代参考仅在接口提供 CPR 时显示。</div>`;
+}
+renderEtfEvidence();
 </script></body></html>
