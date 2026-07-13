@@ -83,6 +83,11 @@ def main():
     ]:
         manifest.append(fetch(pro, api_name, filename, **kwargs))
 
+    # Index data is required to distinguish index strength from stock breadth.
+    # Keep each benchmark separate so a failed index does not erase the others.
+    for index_code in ["000001.SH", "000300.SH", "000905.SH", "000852.SH", "399006.SZ"]:
+        manifest.append(fetch(pro, "index_daily", f"index_daily_{index_code.replace('.', '_')}.csv", ts_code=index_code, start_date=history_dates[0], end_date=history_dates[-1]))
+
     (OUT / "manifest.json").write_text(
         json.dumps({"start_date": start_date, "end_date": end_date, "results": manifest}, ensure_ascii=False, indent=2),
         encoding="utf-8",
