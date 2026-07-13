@@ -69,6 +69,9 @@ def main():
             time.sleep(0.25)
         if trade_date in dates:
             manifest.append(fetch(pro, "fund_daily", f"etf_daily_{trade_date}.csv", trade_date=trade_date))
+            if trade_date == dates[-1]:
+                manifest.append(fetch(pro, "etf_sh_cons", f"etf_sh_cons_{trade_date}.csv", trade_date=trade_date))
+                manifest.append(fetch(pro, "etf_sz_cons", f"etf_sz_cons_{trade_date}.csv", trade_date=trade_date))
             time.sleep(0.25)
 
     for api_name, filename, kwargs in [

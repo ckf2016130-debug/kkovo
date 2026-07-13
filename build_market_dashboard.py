@@ -48,7 +48,20 @@ def load_etfs():
             liquid = out[~excluded].copy()
         out = liquid
         out = out.sort_values("amount_yi", ascending=False)
-        return records(out[[c for c in ["ts_code", "name", "fund_type", "benchmark", "invest_type", "issue_amount", "trade_date", "close", "week_ret", "amount_yi"] if c in out]])
+        component_rows = []
+        for component_path in sorted((ROOT / "data").glob("etf_*_cons_*.csv")):
+            try:
+                component = pd.read_csv(component_path)
+                if {"ts_code", "con_code"}.issubset(component.columns):
+                    component["cpr"] = pd.to_numeric(component.get("cpr"), errors="coerce")
+                    component_rows.append(component[[c for c in ["ts_code", "con_code", "cpr"] if c in component]])
+            except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+                continue
+        if component_rows:
+            component = pd.concat(component_rows, ignore_index=True)
+            component_summary = component.groupby("ts_code", as_index=False).agg(component_count=("con_code", "nunique"), cpr_mean=("cpr", "mean"))
+            out = out.merge(component_summary, on="ts_code", how="left")
+        return records(out[[c for c in ["ts_code", "name", "fund_type", "benchmark", "invest_type", "issue_amount", "trade_date", "close", "week_ret", "amount_yi", "component_count", "cpr_mean"] if c in out]])
     except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
         return []
 
