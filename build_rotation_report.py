@@ -8,7 +8,7 @@ import pandas as pd
 
 DATA = Path("data")
 OUT = Path("output")
-DATES = ["20260706", "20260707", "20260708", "20260709", "20260710"]
+DATES = []
 
 
 def num(s):
@@ -28,17 +28,21 @@ def esc(v):
 
 
 def load():
+    global DATES
+    DATES = sorted(path.stem.split("_")[-1] for path in DATA.glob("daily_*.csv") if path.stem.split("_")[-1].isdigit())[-5:]
+    if len(DATES) < 2:
+        raise RuntimeError("可用交易日数据不足，至少需要两个交易日")
     basic = pd.read_csv(DATA / "stock_basic.csv", dtype={"symbol": str, "list_date": str})
     basic["industry"] = basic["industry"].fillna("未分类").replace("", "未分类")
-    d0 = pd.read_csv(DATA / "daily_20260706.csv")
-    d1 = pd.read_csv(DATA / "daily_20260710.csv")
+    d0 = pd.read_csv(DATA / f"daily_{DATES[0]}.csv")
+    d1 = pd.read_csv(DATA / f"daily_{DATES[-1]}.csv")
     week = d0[["ts_code", "pre_close", "open"]].merge(
         d1[["ts_code", "close", "amount", "pct_chg"]], on="ts_code", how="inner", suffixes=("_start", "_end")
     )
     week["week_ret"] = (num(week["close"]) / num(week["pre_close"]) - 1) * 100
     week["fri_ret"] = num(week["pct_chg"])
 
-    valuation = pd.read_csv(DATA / "daily_basic_20260710.csv")
+    valuation = pd.read_csv(DATA / f"daily_basic_{DATES[-1]}.csv")
     for c in ["turnover_rate", "total_mv", "circ_mv", "pe", "pb"]:
         valuation[c] = num(valuation[c])
 
@@ -183,7 +187,7 @@ def make_html(stocks, sec, daily_sector, limits):
           <details><summary>展开全部 {len(rows)} 只成分股</summary>{all_constituents(rows)}</details>
         </section>""")
 
-    source_note = "TinyShare/Tushare兼容接口：stock_basic、daily、daily_basic、moneyflow、limit_list_d、trade_cal、moneyflow_hsgt、margin；冻结时间为2026-07-10收盘。"
+    source_note = f"TinyShare/Tushare兼容接口：stock_basic、daily、daily_basic、moneyflow、limit_list_d、trade_cal、moneyflow_hsgt、margin；数据窗口为{DATES[0]}至{DATES[-1]}。"
     html_text = f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
     <title>A股资金流与板块轮动周报</title><style>
     :root{{--bg:#f4f6f8;--paper:#fff;--ink:#17202a;--muted:#68727d;--line:#dfe4e8;--red:#c0392b;--green:#16794b;--gold:#b78103;--blue:#275d88}}
@@ -197,7 +201,7 @@ def make_html(stocks, sec, daily_sector, limits):
     .callout{{border-left:4px solid var(--gold);background:#fffaf0;padding:12px 14px}}footer{{max-width:1380px;margin:0 auto 30px;padding:0 24px;color:var(--muted);font-size:12px}}
     @media(max-width:900px){{.kpis{{grid-template-columns:repeat(2,1fr)}}.grid2,.three{{grid-template-columns:1fr}}.sector-head{{display:block}}main{{padding:12px}}section{{padding:14px}}}}
     </style></head><body>
-    <header><h1>A股资金流与板块轮动周报</h1><p>2026年7月6日—7月10日 · 全市场资金、行业强弱、龙头/中军/弹性与条件化推演</p></header><main>
+    <header><h1>A股资金流与板块轮动周报</h1><p>{DATES[0]}—{DATES[-1]} · 全市场资金、行业强弱、龙头/中军/弹性与条件化推演</p></header><main>
     <div class='kpis'><div class='kpi'><b>{len(stocks):,}</b><span>有周收益股票</span></div><div class='kpi'><b class='{('pos' if market_ret>0 else 'neg')}'>{fmt(market_ret)}%</b><span>个股等权周涨跌</span></div><div class='kpi'><b>{fmt(breadth,1)}%</b><span>周上涨家数占比</span></div><div class='kpi'><b class='{('pos' if total_flow>0 else 'neg')}'>{fmt(total_flow)}亿</b><span>5日主力净流合计</span></div><div class='kpi'><b>{int(lim.get('U',0))}/{int(lim.get('Z',0))}/{int(lim.get('D',0))}</b><span>涨停/炸板/跌停次数</span></div></div>
     <section><h2>先看结论</h2><div class='callout'><b>轮动判断框架：</b>“强势延续”要求周收益、五日资金、上涨宽度与周五资金同时为正；“上涨分歧”表示价格强但资金撤退；“潜在轮入”表示周表现仍弱、但周五出现资金回流。它们是下周验证队列，不是确定性预测或买入评级。</div></section>
     <section class='grid2'><div><h2>综合强度前12行业</h2><div class='barlist'>{''.join(bars)}</div><p class='muted'>条形为5日主力净流入/流出，排序综合周收益、资金、上涨宽度和涨跌停结构。</p></div><div><h2>未来动态怎么验证</h2><ol><li><b>延续：</b>周五仍净流入且上涨家数超过55%的板块，观察下周首两日是否继续放量而不出现炸板激增。</li><li><b>切换：</b>“潜在轮入”板块需要周收益转正并连续两日资金净流入才算确认。</li><li><b>退潮：</b>上涨分歧板块若中军转负、炸板增加、龙头跌破本周中枢，优先按退潮处理。</li><li><b>扩散：</b>龙头上涨但板块宽度低于40%，更像个股行情；宽度持续抬升才是板块行情。</li></ol></div></section>
