@@ -64,6 +64,24 @@ def load_etfs():
             nav = pd.concat(nav_rows, ignore_index=True).sort_values(["ts_code", "nav_date"]).drop_duplicates("ts_code", keep="last")
             out = out.merge(nav, on="ts_code", how="left")
             out["premium_discount"] = (out["close"] / out["unit_nav"] - 1) * 100
+        share_rows = []
+        for share_path in sorted((ROOT / "data").glob("fund_share_*.csv")):
+            try:
+                share = pd.read_csv(share_path)
+                share_col = "fd_share" if "fd_share" in share.columns else "share" if "share" in share.columns else None
+                if share_col and "ts_code" in share.columns:
+                    share["share_value"] = pd.to_numeric(share[share_col], errors="coerce")
+                    share["share_date"] = share.get("trade_date", share_path.stem.split("_")[-1]).astype(str)
+                    share_rows.append(share[["ts_code", "share_date", "share_value"]])
+            except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+                continue
+        if share_rows:
+            shares = pd.concat(share_rows, ignore_index=True).dropna(subset=["share_value"]).sort_values(["ts_code", "share_date"])
+            share_first = shares.groupby("ts_code", as_index=False).first()[["ts_code", "share_value"]].rename(columns={"share_value": "share_start"})
+            share_last = shares.groupby("ts_code", as_index=False).last()[["ts_code", "share_date", "share_value"]].rename(columns={"share_value": "share_latest"})
+            out = out.merge(share_last, on="ts_code", how="left").merge(share_first, on="ts_code", how="left")
+            out["share_change"] = out["share_latest"] - out["share_start"]
+            out["share_change_pct"] = (out["share_latest"] / out["share_start"] - 1) * 100
         component_rows = []
         for component_path in sorted((ROOT / "data").glob("etf_*_cons_*.csv")):
             try:
@@ -89,7 +107,7 @@ def load_etfs():
         out["tool_role"] = out.apply(classify_etf, axis=1)
         out["tool_relevance_score"] = (pd.to_numeric(out["amount_yi"], errors="coerce").clip(lower=0, upper=20) / 20 * 50 + out["benchmark"].fillna("").astype(str).str.len().clip(upper=20) / 20 * 20).round(1)
         out["selection_reason"] = out.apply(lambda r: f"{r['tool_role']}；成交额 {float(r['amount_yi']):.2f}亿" if pd.notna(r.get("amount_yi")) else f"{r['tool_role']}；成交额缺失", axis=1)
-        return records(out[[c for c in ["ts_code", "name", "fund_type", "benchmark", "invest_type", "issue_amount", "trade_date", "close", "week_ret", "amount_yi", "nav_date", "unit_nav", "accum_nav", "net_asset", "premium_discount", "component_count", "cpr_mean", "tool_role", "tool_relevance_score", "selection_reason"] if c in out]])
+        return records(out[[c for c in ["ts_code", "name", "fund_type", "benchmark", "invest_type", "issue_amount", "trade_date", "close", "week_ret", "amount_yi", "nav_date", "unit_nav", "accum_nav", "net_asset", "premium_discount", "share_date", "share_latest", "share_change", "share_change_pct", "component_count", "cpr_mean", "tool_role", "tool_relevance_score", "selection_reason"] if c in out]])
     except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
         return []
 
@@ -703,7 +721,9 @@ def build():
     valuation_ui = r'''const priorValuationRange=typeof updateValuationRange==='function'?updateValuationRange:null;if(priorValuationRange){updateValuationRange=function(){priorValuationRange();const box=document.querySelector('#valuationOverview');if(!box)return;let note=box.querySelector('.valuation-assumption-note');if(!note){note=document.createElement('div');note.className='valuation-assumption-note source';box.appendChild(note)}note.textContent=`估值解释：中性参考价=(基准PE×标准化EPS + 基准PB×BPS + 五年FCFE折现结果)÷3；合理区间取悲观/乐观情景的边界。当前假设：PE ${document.querySelector('#vPeBase')?.value||'—'} 倍、PB ${document.querySelector('#vPbBase')?.value||'—'} 倍、FCFE增长 ${document.querySelector('#vGrowth')?.value||'—'}%、折现率 ${document.querySelector('#vDiscount')?.value||'—'}%、永续增长 ${document.querySelector('#vTerminal')?.value||'—'}%。财务覆盖率 ${fmt(selectedStock?.fundamental_coverage,0)}%；覆盖不足或行业不适配时，估值只作区间参考，不作为目标价。`};updateValuationRange();document.querySelectorAll('.valuation-form input').forEach(i=>i.addEventListener('input',()=>setTimeout(updateValuationRange,0)))}const valuationStyle=document.createElement('style');valuationStyle.textContent='.valuation-assumption-note{grid-column:1/-1;padding:8px;background:var(--panel2);line-height:1.6}';document.head.appendChild(valuationStyle)
 '''
     template = template.replace("const sectorAgentBox", stock_agent_ui + "const sectorAgentBox")
-    trade_plan_ui = stock_agent_ui + valuation_ui + r'''
+    etf_share_ui = r'''const etfShareBox=document.querySelector('#etfBoard');if(etfShareBox&&!document.querySelector('#etfShareEvidence')){const rows=etfs.filter(x=>x.share_change_pct!==null&&x.share_change_pct!==undefined).slice(0,8);etfShareBox.insertAdjacentHTML('beforeend',`<div id="etfShareEvidence" class="source etf-share-evidence"><b>基金份额变化</b>：${rows.length?rows.map(x=>`${escHtml(x.name||x.ts_code)} ${fmt(x.share_change_pct,2)}%`).join(' · '):'接口未返回基金份额变化，无法估算申赎方向'}。该指标是基金份额快照变化，不等于纯申购赎回金额；需结合净值、价格和成交额判断。</div>`);const style=document.createElement('style');style.textContent='.etf-share-evidence{padding:8px;background:var(--panel2);line-height:1.6}.etf-share-evidence b{color:var(--gold)}';document.head.appendChild(style)}
+'''
+    trade_plan_ui = stock_agent_ui + valuation_ui + etf_share_ui + r'''
 const tradePlanAnchor=document.querySelector('#overviewView .decision-grid');
 if(tradePlanAnchor&&!document.querySelector('#tradePlanPanel')){
   const panel=document.createElement('section');panel.id='tradePlanPanel';panel.className='panel change-panel';
