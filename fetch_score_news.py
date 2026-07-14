@@ -53,12 +53,12 @@ def score(row):
 
 
 MACRO_SOURCES = [
-    ("China CPI", "macro_china_cpi_monthly", "https://www.stats.gov.cn/", "inflation"),
-    ("US CPI", "macro_usa_cpi_monthly", "https://www.bls.gov/cpi/", "overseas_inflation"),
-    ("US Core CPI", "macro_usa_core_cpi_monthly", "https://www.bls.gov/cpi/", "overseas_inflation"),
-    ("China repo rate", "repo_rate_query", "http://www.pbc.gov.cn/", "liquidity"),
-    ("China LPR", "macro_china_lpr", "http://www.pbc.gov.cn/", "monetary_policy"),
-    ("US policy rate", "macro_bank_usa_interest_rate", "https://www.federalreserve.gov/", "overseas_rate"),
+    ("\u4e2d\u56fd CPI", "macro_china_cpi_monthly", "https://www.stats.gov.cn/", "inflation"),
+    ("\u7f8e\u56fd CPI", "macro_usa_cpi_monthly", "https://www.bls.gov/cpi/", "overseas_inflation"),
+    ("\u7f8e\u56fd\u6838\u5fc3 CPI", "macro_usa_core_cpi_monthly", "https://www.bls.gov/cpi/", "overseas_inflation"),
+    ("\u4e2d\u56fd\u56de\u8d2d\u5229\u7387", "repo_rate_query", "http://www.pbc.gov.cn/", "liquidity"),
+    ("\u4e2d\u56fd LPR", "macro_china_lpr", "http://www.pbc.gov.cn/", "monetary_policy"),
+    ("\u7f8e\u8054\u50a8\u653f\u7b56\u5229\u7387", "macro_bank_usa_interest_rate", "https://www.federalreserve.gov/", "overseas_rate"),
 ]
 
 
@@ -66,20 +66,20 @@ def macro_event(label, function_name, url, category, row):
     values = {str(k): str(v) for k, v in row.items() if pd.notna(v) and str(v).strip() not in ("", "nan", "None")}
     if not values:
         return None
-    date_value = next((v for k, v in values.items() if any(x in k.lower() for x in ("date", "time", "date", "time", "release"))), "")
+    date_value = next((v for k, v in values.items() if any(x in k.lower() for x in ("date", "time", "release", "\u65e5\u671f", "\u65f6\u95f4", "\u53d1\u5e03"))), "")
     latest = "; ".join(f"{k}: {v}" for k, v in list(values.items())[:8])
     item = {
-        "time": date_value or str(today), "title": f"Macro | {label}: {latest[:180]}", "content": latest,
-        "source": f"Official macro | {label}", "url": url, "ts_code": "", "name": "", "industry": "Macro policy",
+        "time": date_value or str(today), "retrieved_at": str(today), "title": f"\u5b8f\u89c2\uff5c{label}: {latest[:180]}", "content": latest,
+        "source": f"\u5b98\u65b9\u5b8f\u89c2\u6570\u636e\uff5c{label}", "url": url, "ts_code": "", "name": "", "industry": "\u5b8f\u89c2\u653f\u7b56",
         "macro_category": category, "is_macro": True, "impact_type": "Indirect", "impact_scope": "Index + sectors + ETF",
-        "impact_strength": "High", "direction": "Neutral pending expectation comparison", "direction_score": 0,
-        "market_acceptance": "Needs price and expectation validation",
-        "validation": "Compare prior value, consensus expectation, index breadth, bond yield and sector relative strength",
-        "reasons": "Official macro release; this dashboard does not infer bullish/bearish direction without a comparable consensus",
+        "impact_strength": "\u9ad8", "direction": "\u4e2d\u6027\u5f85\u524d\u503c/\u9884\u671f\u9a8c\u8bc1", "direction_score": 0,
+        "market_acceptance": "\u9700\u7ed3\u5408\u4ef7\u683c\u3001\u8d44\u91d1\u548c\u4e00\u81f4\u9884\u671f\u9a8c\u8bc1",
+        "validation": "\u6bd4\u8f83\u524d\u503c\u4e0e\u4e00\u81f4\u9884\u671f\uff0c\u518d\u89c2\u5bdf\u6307\u6570\u5bbd\u5ea6\u3001\u5229\u7387\u3001\u76f8\u5173\u677f\u5757\u548c ETF \u662f\u5426\u540c\u6b65",
+        "reasons": "\u5b98\u65b9\u5b8f\u89c2\u6570\u636e\uff1b\u7f3a\u5c11\u53ef\u6bd4\u4e00\u81f4\u9884\u671f\u65f6\u4e0d\u76f4\u63a5\u5224\u65ad\u5229\u591a\u6216\u5229\u7a7a",
     }
     item = score(item)
     item.update({"value_score": 90, "trust_score": 90, "direction_score": 0, "macro_category": category,
-                 "is_macro": True, "score_formula": "Official macro source 90; direction requires prior/consensus and market-price validation"})
+                 "is_macro": True, "score_formula": "\u5b98\u65b9\u5b8f\u89c2\u6765\u6e90 90 \u5206\uff1b\u65b9\u5411\u5fc5\u987b\u7ed3\u5408\u524d\u503c/\u4e00\u81f4\u9884\u671f\u4e0e\u5e02\u573a\u4ef7\u683c\u9a8c\u8bc1"})
     return item
 
 

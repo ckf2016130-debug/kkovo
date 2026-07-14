@@ -480,6 +480,9 @@ def build():
     }
     sector_map = {x.get("industry"): x for x in sectors}
     news_top = sorted(news, key=lambda x: float(x.get("value_score") or 0), reverse=True)[:3]
+    macro_top = next((x for x in sorted(news, key=lambda x: float(x.get("value_score") or 0), reverse=True) if x.get("is_macro") is True), None)
+    if macro_top and not any(x.get("is_macro") is True for x in news_top):
+        news_top = (news_top[:2] + [macro_top])[:3]
     news_briefs = []
     for item in news_top:
         direction_score = float(item.get("direction_score") or 0)
@@ -511,6 +514,13 @@ def build():
         impact["impact_chain"] = [{"stage": "消息", "value": item.get("title"), "evidence": f"{item.get('time') or '时间未知'} · 来源 {item.get('source') or '未知'}"}, {"stage": "板块", "value": industry, "evidence": f"影响类型：{impact['impact_type']} · 强度：{impact_strength}"}, {"stage": "资金", "value": industry if sector else "暂无映射", "evidence": f"5日主力净流 {sector_flow:.2f}亿" if sector_flow is not None else "暂无真实资金证据"}, {"stage": "价格", "value": f"{sector_ret:.2f}%" if sector_ret is not None else "暂无价格证据", "evidence": "当前窗口表现，不等于消息因果"}, {"stage": "标的", "value": affected_stock or affected_etf or "暂无映射", "evidence": "个股/ETF仅作观察对象，不代表交易建议"}, {"stage": "验证", "value": "待下一交易日确认", "evidence": impact["validation"]}]
         item.update(impact)
         news_briefs.append({"title": item.get("title"), "url": item.get("url"), "source": item.get("source"), "time": item.get("time"), "industry": industry, "name": affected_stock, "direction": direction, "value_score": item.get("value_score"), "trust_score": item.get("trust_score"), "score_breakdown": item.get("score_breakdown"), "score_formula": item.get("score_formula"), "reason": item.get("reasons"), **impact})
+    macro_profiles = {"inflation": ("周期/资源、金融", "高估值成长、消费"), "overseas_inflation": ("价值、防御", "海外敏感成长"), "liquidity": ("宽基、金融、地产链", "高杠杆与高估值方向"), "monetary_policy": ("利率敏感资产", "利率上行敏感方向"), "overseas_rate": ("美元/利率受益方向", "高估值成长、外资敏感方向")}
+    for brief, raw in zip(news_briefs, news_top):
+        if raw.get("is_macro") is True:
+            category = raw.get("macro_category")
+            benefit, risk = macro_profiles.get(category, ("需结合数据方向确认", "需结合数据方向确认"))
+            brief.update({"is_macro": True, "macro_category": category, "industry": "宏观政策", "impact_type": "间接影响（宏观情景映射）", "impact_scope": "指数+风格+板块+ETF（情景映射）", "affected_stock": None, "affected_etf": None, "macro_benefit_scenarios": benefit, "macro_risk_scenarios": risk, "validation": raw.get("validation") or "比较前值与一致预期，再观察指数宽度、利率、相关板块和 ETF 是否同步"})
+            brief["impact_chain"] = [{"stage": "宏观数据", "value": raw.get("title"), "evidence": f"发布/数据日期：{raw.get('time') or '未知'} · 来源：{raw.get('source') or '未知'}"}, {"stage": "受益情景", "value": benefit, "evidence": "仅为传导假设，需价格和资金验证"}, {"stage": "受损情景", "value": risk, "evidence": "仅为传导假设，需价格和资金验证"}, {"stage": "验证", "value": "等待下一交易日或预期差确认", "evidence": brief.get("validation") or "暂无"}]
     chain_head = news_briefs[0] if news_briefs else None
     overseas_lead = next((x for x in overseas if x.get("targets")), None)
     logic_chain = [{"label": "国内消息", "value": chain_head.get("title") if chain_head else "暂无高价值消息", "evidence": f"时间 {chain_head.get('time')} · 价值 {chain_head.get('value_score')} · 可信度 {chain_head.get('trust_score')}" if chain_head else "暂无真实消息", "action": "news", "url": chain_head.get("url") if chain_head else None}]
@@ -725,7 +735,9 @@ def build():
 '''
     news_ui = r'''const impactMapSection=document.querySelector('.impact-map'),newsView=document.querySelector('#newsView');if(impactMapSection&&newsView&&impactMapSection.parentElement!==newsView)newsView.appendChild(impactMapSection);const impactMap=document.querySelector('#newsImpactMap');if(impactMap&&!document.querySelector('#impactNewsSwitcher')){const sw=document.createElement('div');sw.id='impactNewsSwitcher';sw.className='impact-news-switcher';const rows=(summary.news_briefs||news).slice().sort((a,b)=>Number(b.value_score||0)-Number(a.value_score||0)).slice(0,12);sw.innerHTML='<button class="btn active" data-impact-index="all">全部消息</button>'+rows.slice(0,3).map((x,i)=>`<button class="btn" data-impact-index="${i}">消息${i+1}</button>`).join('');impactMap.parentNode.insertBefore(sw,impactMap);const apply=i=>{impactMap.querySelectorAll('.impact-item').forEach((el,n)=>el.style.display=i===null||n===i?'':'none');sw.querySelectorAll('button').forEach((b,n)=>b.classList.toggle('active',(i===null&&n===0)||(i!==null&&n===i+1)))};sw.querySelectorAll('button').forEach(b=>b.onclick=()=>apply(b.dataset.impactIndex==='all'?null:Number(b.dataset.impactIndex)))}const impactSwitchStyle=document.createElement('style');impactSwitchStyle.textContent='.impact-news-switcher{display:flex;gap:5px;padding:8px 9px;border:1px solid var(--line);border-bottom:0;background:var(--panel);overflow:auto}.impact-news-switcher .btn{white-space:nowrap}';document.head.appendChild(impactSwitchStyle);
 '''
-    trade_plan_ui = stock_agent_ui + valuation_ui + etf_share_ui + news_ui + r'''
+    news_switch_ui = r'''const impactRowsForSwitch=(summary.news_briefs||news).slice().sort((a,b)=>Number(b.value_score||0)-Number(a.value_score||0)).slice(0,12);document.querySelectorAll('#newsImpactMap .impact-item').forEach((el,i)=>{const x=impactRowsForSwitch[i];if(x?.is_macro)el.insertAdjacentHTML('afterbegin',`<small class="macro-badge">宏观类别：${escHtml(x.macro_category||'宏观数据')} · 受益情景：${escHtml(x.macro_benefit_scenarios||'需验证')} · 风险情景：${escHtml(x.macro_risk_scenarios||'需验证')}</small>`)});document.querySelectorAll('#topNewsList .news-brief').forEach((el,i)=>{el.addEventListener('click',e=>{if(e.target.closest('a'))return;showView('newsView');const b=document.querySelector(`#impactNewsSwitcher button[data-impact-index="${i}"]`);b?.click()})});const macroBadgeStyle=document.createElement('style');macroBadgeStyle.textContent='.macro-badge{color:var(--gold)!important;border-left:2px solid var(--gold);padding-left:6px}';document.head.appendChild(macroBadgeStyle)
+'''
+    trade_plan_ui = stock_agent_ui + valuation_ui + etf_share_ui + news_ui + news_switch_ui + r'''
 const tradePlanAnchor=document.querySelector('#overviewView .decision-grid');
 if(tradePlanAnchor&&!document.querySelector('#tradePlanPanel')){
   const panel=document.createElement('section');panel.id='tradePlanPanel';panel.className='panel change-panel';
