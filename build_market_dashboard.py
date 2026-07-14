@@ -39,7 +39,8 @@ def load_etfs():
         last = daily.groupby("ts_code", as_index=False).last()[["ts_code", "trade_date", "close", "amount"]].rename(columns={"trade_date":"trade_date", "close":"close", "amount":"amount"})
         out = basic.merge(last, on="ts_code", how="inner").merge(first, on="ts_code", how="left")
         out["week_ret"] = (out["close"] / out["start_close"] - 1) * 100
-        out["amount_yi"] = pd.to_numeric(out.get("amount"), errors="coerce") / 100000000
+        # TinyShare/Tushare fund_daily amount is in thousand yuan, same as stock daily amount.
+        out["amount_yi"] = pd.to_numeric(out.get("amount"), errors="coerce") / 100000
         # Keep ETFs with actual market reference value; debt, currency and tiny inactive samples are noise here.
         name_text = out.get("name", pd.Series("", index=out.index)).fillna("").astype(str)
         excluded = name_text.str.contains("债|货币|同业存单|短融|国债|政金|美元|日元", regex=True)
