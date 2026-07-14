@@ -545,10 +545,15 @@ def build():
     logic_chain = []
     if overseas_lead:
         logic_chain.append({"label": "海外变量", "value": overseas_lead.get("asset"), "evidence": f"5日 {overseas_lead.get('ret_5d')}% · 映射 { '、'.join(overseas_lead.get('targets') or []) } · {overseas_lead.get('state')}", "action": "overseas"})
+    else:
+        logic_chain.append({"label": "海外变量", "value": "暂无可验证海外变量", "evidence": "当前快照没有同时满足价格、映射和相关性条件的海外证据；不把缺失信息当作利多或利空", "action": "overseas"})
     logic_chain.append({"label": "国内消息", "value": chain_head.get("title") if chain_head else "暂无高价值消息", "evidence": f"时间 {chain_head.get('time')} · 价值 {chain_head.get('value_score')} · 可信度 {chain_head.get('trust_score')}" if chain_head else "暂无真实消息", "action": "news", "url": chain_head.get("url") if chain_head else None})
+    fund_sector = chain_sector if chain_sector in sector_map else lead_in
+    fund_value = float(sector_map.get(fund_sector, {}).get("net_mf_yi") or 0) if fund_sector else None
+    fund_relation = "与消息映射板块一致" if fund_sector and fund_sector == chain_sector else "与消息映射板块不同，当前仅作市场资金方向参考"
     logic_chain.extend([
         {"label": "影响板块", "value": chain_sector or "未映射", "evidence": f"{chain_head.get('impact_type')} · {chain_head.get('impact_scope')}" if chain_head else "暂无消息映射证据", "action": "sector", "target": chain_sector},
-        {"label": "资金验证", "value": lead_in or "暂无承接方向", "evidence": f"板块5日净流 {float(sector_map.get(lead_in, {}).get('net_mf_yi') or 0):.2f}亿" if lead_in else "暂无数据", "action": "sector", "target": lead_in},
+        {"label": "资金验证", "value": fund_sector or "暂无承接方向", "evidence": f"板块5日净流 {fund_value:.2f}亿 · {fund_relation}" if fund_value is not None else "暂无数据", "action": "sector", "target": fund_sector},
         {"label": "个股/ETF价格", "value": (chain_stock.get("name") if chain_stock is not None else chain_etf.get("name") if chain_etf else "暂无可映射标的"), "evidence": f"个股等权 {mean_ret:.2f}% · 上涨宽度 {breadth:.1f}%" if breadth is not None else "暂无价格证据", "action": "stock" if chain_stock is not None else "overview", "target": chain_stock.get("ts_code") if chain_stock is not None else None},
         {"label": "验证", "value": "价格与资金初步认可" if chain_head and chain_head.get("market_acceptance") == "价格与资金初步认可" else "尚不能确认因果", "evidence": "下一交易日复核板块资金、龙头/中军与ETF是否同步；时间相关性不等于因果", "action": "overview"},
     ])
