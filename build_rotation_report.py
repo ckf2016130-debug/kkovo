@@ -114,11 +114,11 @@ def analyze(stocks, flow, limits):
 
     def state(r):
         if r.week_ret > 0 and r.net_mf_yi > 0 and r.breadth >= 55 and r.fri_flow_yi >= 0:
-            return "强势延续"
+            return "强势板块延续"
         if r.week_ret > 0 and (r.net_mf_yi < 0 or r.fri_flow_yi < 0):
-            return "上涨分歧"
+            return "上涨但资金背离"
         if r.week_ret <= 0 and r.fri_flow_yi > 0 and r.breadth >= 40:
-            return "潜在轮入"
+            return "潜在轮动方向"
         if r.week_ret < 0 and r.net_mf_yi < 0:
             return "弱势流出"
         return "震荡观察"

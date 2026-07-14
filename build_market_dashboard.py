@@ -420,7 +420,7 @@ def build():
     proxy_links = sorted(proxy_links, key=lambda x: x["value"], reverse=True)[:16]
     rotation_paths = [{"from": s.get("industry"), "to": t.get("industry"), "value": round(min(abs(float(s.get("net_mf_yi") or 0)), abs(float(t.get("net_mf_yi") or 0))), 2), "confidence": "中"} for s, t in zip(top_out, top_in)]
     strongest = max(sectors, key=lambda x: float(x.get("strength") or 0), default={})
-    rotation_candidates = [x for x in sectors if x.get("state") == "潜在轮入"]
+    rotation_candidates = [x for x in sectors if x.get("state") == "潜在轮动方向"]
     trade_sector = max(rotation_candidates or sectors, key=lambda x: float(x.get("trade_value_score") or 0), default={})
     latest_price_map = {}
     if prices:
@@ -679,6 +679,7 @@ def build():
     except OSError:
         pass
     template = (ROOT / "market_dashboard_template.html").read_text(encoding="utf-8")
+    template = template.replace("强势延续", "强势板块延续").replace("潜在轮入", "潜在轮动方向").replace("上涨分歧", "上涨但资金背离")
     replacements = {
         "__SECTORS__": json.dumps(sectors, ensure_ascii=False, separators=(",", ":")),
         "__STOCKS__": json.dumps(stocks, ensure_ascii=False, separators=(",", ":")),
@@ -702,6 +703,8 @@ if(tradePlanAnchor&&!document.querySelector('#tradePlanPanel')){
   panel.querySelectorAll('[data-plan-etf]').forEach(b=>b.onclick=()=>{showView('overviewView');document.querySelector('#etfBoard')?.scrollIntoView({behavior:'smooth',block:'center'})});
   const style=document.createElement('style');style.textContent='.trade-plan-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:7px;padding:9px}.trade-plan-card{background:var(--panel2);padding:10px;border-top:2px solid var(--gold);min-width:0}.trade-plan-title b,.trade-plan-title small{display:block}.trade-plan-title b{color:var(--text);overflow-wrap:anywhere}.trade-plan-title small,.trade-plan-evidence{color:var(--muted);font-size:11px;line-height:1.5;margin-top:4px}.trade-plan-card>div:not(.trade-plan-title):not(.trade-plan-evidence){font-size:11px;color:var(--muted);line-height:1.5;margin-top:7px}.trade-plan-card strong{color:var(--gold);display:block}.trade-plan-card button{margin-top:8px}@media(max-width:1200px){.trade-plan-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:600px){.trade-plan-grid{grid-template-columns:1fr}}';document.head.appendChild(style)
 }
+const sectorAgentBox=document.querySelector('#sectorAgentChart')?.parentElement;if(sectorAgentBox&&!document.querySelector('#sectorAgentCurrent')){const box=document.createElement('div');box.id='sectorAgentCurrent';box.className='agent-current';sectorAgentBox.appendChild(box);const render=()=>{const rows=selectedSector?.agent_flows||[];box.innerHTML='<div class="agent-current-title">当前板块代理资金明细 <small>5日主力净流回算；估算，不代表账户归属</small></div>'+rows.map(x=>`<div class="agent-current-row"><span>${escHtml(x.name)}<small>${escHtml(x.basis||'')} · 覆盖 ${fmt(x.coverage,0)} 家</small></span><b class="${cls(x.value)}">${fmt(x.value)}亿</b><em>${escHtml(x.direction||'暂无数据')}</em></div>`).join('')||'<div class="empty">暂无足够覆盖数据</div>'};const prior=renderSector;renderSector=function(){prior();render()};render()}
+const agentCurrentStyle=document.createElement('style');agentCurrentStyle.textContent='.agent-current{padding:9px;border-top:1px solid var(--line2)}.agent-current-title{color:var(--gold);font-weight:700;margin-bottom:5px}.agent-current-title small{color:var(--muted);font-weight:400;margin-left:8px}.agent-current-row{display:grid;grid-template-columns:1fr 80px 60px;gap:7px;padding:6px 0;border-bottom:1px solid var(--line2);font-size:12px}.agent-current-row small{display:block;color:var(--muted);font-size:10px;margin-top:2px}.agent-current-row b{text-align:right}.agent-current-row em{text-align:right;font-style:normal;color:var(--muted)}';document.head.appendChild(agentCurrentStyle)
 '''
     template = template.replace('</script></body></html>', trade_plan_ui + '</script></body></html>')
     OUT.mkdir(parents=True, exist_ok=True)
