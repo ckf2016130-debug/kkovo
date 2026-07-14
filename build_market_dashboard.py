@@ -374,6 +374,7 @@ def build():
             sector["agent_flows"].append({"name": name, "value": value, "direction": "净流入" if value is not None and value > 0 else "净流出" if value is not None and value < 0 else "暂无数据", "coverage": int(len(sample)), "basis": basis})
     agent_series = []
     sector_agent_series = {}
+    stock_agent_series = {}
     stock_class = stocks_frame[["ts_code", "circ_mv_yi", "turnover_rate", "U", "Z"]].copy()
     cap_mid = stocks_frame["circ_mv_yi"].median()
     turn_mid = stocks_frame["turnover_rate"].median()
@@ -397,10 +398,15 @@ def build():
                     grouped = merged.loc[mask].groupby("industry")["net_mf_amount"].sum() / 100000
                     for industry, sector_value in grouped.items():
                         sector_agent_series.setdefault(str(industry), []).append({"trade_date": date, "name": name, "value": round(float(sector_value), 2)})
+                    stock_grouped = merged.loc[mask].groupby("ts_code")["net_mf_amount"].sum() / 100000
+                    for code, stock_value in stock_grouped.items():
+                        stock_agent_series.setdefault(str(code), []).append({"trade_date": date, "name": name, "value": round(float(stock_value), 2)})
         except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
             continue
     for sector in sectors:
         sector["agent_series"] = sector_agent_series.get(str(sector.get("industry")), [])
+    for stock in stocks:
+        stock["agent_series"] = stock_agent_series.get(str(stock.get("ts_code")), [])
     flow_values = pd.to_numeric(pd.Series([x.get("net_mf_yi") for x in sectors]), errors="coerce")
     flow_rank = flow_values.rank(pct=True).fillna(0.5) * 100
     for sector, rank in zip(sectors, flow_rank.tolist()):
@@ -692,7 +698,10 @@ def build():
     }
     for key, value in replacements.items():
         template = template.replace(key, value)
-    trade_plan_ui = r'''
+    stock_agent_ui = r'''const stockAgentAnchor=document.querySelector('#stockView .stock-evidence');if(stockAgentAnchor&&!document.querySelector('#stockAgentChart')){const panel=document.createElement('section');panel.className='panel stock-agent-evidence';panel.innerHTML='<div class="head">个股四类代理资金 <small>按个股日级主力净流回算；估算，不代表账户归属</small></div><div id="stockAgentChart" class="chart"></div>';stockAgentAnchor.parentNode.insertBefore(panel,stockAgentAnchor.nextSibling);const chart=echarts.init(document.querySelector('#stockAgentChart'));const names=['国家队代理','机构代理','游资代理','散户代理'],colors=[C.gold,C.cyan,C.up,C.down];const render=()=>{const rows=selectedStock?.agent_series||[],dates=[...new Set(rows.map(x=>String(x.trade_date)))].sort();chart.setOption({animation:false,tooltip:{...tooltip,trigger:'axis'},legend:{data:names,textStyle:{color:C.muted}},grid:{left:58,right:18,top:35,bottom:32},xAxis:{type:'category',data:dates.map(shortDate),axisLabel:{color:C.muted}},yAxis:{name:'亿元',axisLabel:{color:C.muted},splitLine:{lineStyle:{color:'#24303a'}}},series:names.map((name,i)=>({name,type:'line',showSymbol:false,smooth:true,data:dates.map(d=>{const x=rows.find(v=>String(v.trade_date)===d&&v.name===name);return x?x.value:null}),lineStyle:{color:colors[i]},itemStyle:{color:colors[i]}}))},true)};const prior=renderStock;renderStock=function(){prior();render()};render()}const stockAgentStyle=document.createElement('style');stockAgentStyle.textContent='.stock-agent-evidence{height:300px;margin-top:7px}.stock-agent-evidence .chart{height:calc(100% - 39px)}';document.head.appendChild(stockAgentStyle)
+'''
+    template = template.replace("const sectorAgentBox", stock_agent_ui + "const sectorAgentBox")
+    trade_plan_ui = stock_agent_ui + r'''
 const tradePlanAnchor=document.querySelector('#overviewView .decision-grid');
 if(tradePlanAnchor&&!document.querySelector('#tradePlanPanel')){
   const panel=document.createElement('section');panel.id='tradePlanPanel';panel.className='panel change-panel';
