@@ -422,6 +422,23 @@ def build():
     strongest = max(sectors, key=lambda x: float(x.get("strength") or 0), default={})
     rotation_candidates = [x for x in sectors if x.get("state") == "潜在轮入"]
     trade_sector = max(rotation_candidates or sectors, key=lambda x: float(x.get("trade_value_score") or 0), default={})
+    latest_price_map = {}
+    if prices:
+        price_frame_for_plan = pd.DataFrame(prices)
+        if not price_frame_for_plan.empty and {"ts_code", "trade_date", "close"}.issubset(price_frame_for_plan.columns):
+            price_frame_for_plan = price_frame_for_plan.sort_values("trade_date").drop_duplicates("ts_code", keep="last")
+            latest_price_map = dict(zip(price_frame_for_plan["ts_code"].astype(str), pd.to_numeric(price_frame_for_plan["close"], errors="coerce")))
+    trade_plan = []
+    trade_industry = trade_sector.get("industry")
+    if trade_industry:
+        candidates = stocks_frame[stocks_frame["industry"].eq(trade_industry)].copy()
+        candidates["role_score"] = pd.to_numeric(candidates.get("leader_score"), errors="coerce").fillna(0) * 0.45 + pd.to_numeric(candidates.get("core_score"), errors="coerce").fillna(0) * 0.35 + pd.to_numeric(candidates.get("elastic_score"), errors="coerce").fillna(0) * 0.20
+        for _, candidate in candidates.sort_values("role_score", ascending=False).head(3).iterrows():
+            code = str(candidate.get("ts_code"))
+            role = "龙头候选" if float(candidate.get("leader_score") or 0) >= max(float(candidate.get("core_score") or 0), float(candidate.get("elastic_score") or 0)) else "中军/趋势候选"
+            trade_plan.append({"kind": "个股", "name": candidate.get("name"), "ts_code": code, "industry": trade_industry, "role": role, "price": float(latest_price_map[code]) if code in latest_price_map and pd.notna(latest_price_map[code]) else None, "evidence": f"周涨跌 {float(candidate.get('week_ret') or 0):.2f}% · 5日主力净流 {float(candidate.get('net_mf_5d_yi') or 0):.2f}亿 · 基本面覆盖 {float(candidate.get('fundamental_coverage') or 0):.0f}%", "continue_if": f"{trade_industry}资金继续为正，且该股相对板块不转弱", "drop_if": "板块资金转负、个股跌破支撑或龙头/中军同步走弱"})
+    for etf in sorted([x for x in etfs if x.get("tool_role") in {"宽基工具", "行业/风格工具", "海外联动"}], key=lambda x: float(x.get("tool_relevance_score") or 0), reverse=True)[:2]:
+        trade_plan.append({"kind": "ETF", "name": etf.get("name"), "ts_code": etf.get("ts_code"), "industry": etf.get("benchmark") or etf.get("tool_role"), "role": etf.get("tool_role"), "price": etf.get("close"), "evidence": etf.get("selection_reason") or "工具类型与成交额可用", "continue_if": "跟踪基准与对应板块方向同步，成交额和溢价/折价没有异常扩大", "drop_if": "跟踪基准脱钩、溢价/折价异常或成交流动性明显下降"})
     if mean_ret > 0 and (positive_flow or 0) < 50:
         main_conflict = "指数和个股表现改善，但资金广度不足，仍是存量轮动而非全面增量"
     elif (breadth or 0) < 40 and (positive_flow or 0) < 45:
@@ -606,6 +623,7 @@ def build():
         "trade_sector": trade_sector.get("industry"),
         "trade_sector_score": trade_sector.get("trade_value_score"),
         "trade_sector_reason": f"交易价值 {float(trade_sector.get('trade_value_score') or 0):.1f}/100：{trade_sector.get('trade_value_reason', '优先观察有资金承接且上涨宽度较好的方向')}；仍需下一交易日验证",
+        "trade_plan": trade_plan,
         "position": round(min(80, max(20, money_effect * 0.7)), 0),
         "confidence": "中",
         "validation": f"验证点：观察 {lead_in or '最强承接方向'} 次日是否继续净流入，并确认龙头、中军与板块同步。",
@@ -673,6 +691,19 @@ def build():
     }
     for key, value in replacements.items():
         template = template.replace(key, value)
+    trade_plan_ui = r'''
+const tradePlanAnchor=document.querySelector('#overviewView .decision-grid');
+if(tradePlanAnchor&&!document.querySelector('#tradePlanPanel')){
+  const panel=document.createElement('section');panel.id='tradePlanPanel';panel.className='panel change-panel';
+  const plans=summary.trade_plan||[];
+  panel.innerHTML=`<div class="head">今日观察清单 <small>基于真实快照生成，不是买卖指令</small></div><div class="trade-plan-grid">${plans.map(x=>`<div class="trade-plan-card"><div class="trade-plan-title"><b>${escHtml(x.name||x.ts_code||'未知')}</b><small>${escHtml(x.kind||'')} · ${escHtml(x.role||'')} · ${escHtml(x.industry||'')}</small></div><div class="trade-plan-evidence">${escHtml(x.evidence||'暂无证据')}</div><div><strong>继续观察</strong>${escHtml(x.continue_if||'暂无')}</div><div><strong>放弃观察</strong>${escHtml(x.drop_if||'暂无')}</div><button class="impact-link" data-plan-stock="${escHtml(x.kind==='个股'?x.ts_code||'':'')}" data-plan-etf="${escHtml(x.kind==='ETF'?x.ts_code||'':'')}">查看相关证据</button></div>`).join('')||'<div class="empty">当前没有足够的真实快照生成观察清单</div>'}</div>`;
+  tradePlanAnchor.parentNode.insertBefore(panel,tradePlanAnchor.nextSibling);
+  panel.querySelectorAll('[data-plan-stock]').forEach(b=>b.onclick=()=>b.dataset.planStock&&selectStock(b.dataset.planStock,true));
+  panel.querySelectorAll('[data-plan-etf]').forEach(b=>b.onclick=()=>{showView('overviewView');document.querySelector('#etfBoard')?.scrollIntoView({behavior:'smooth',block:'center'})});
+  const style=document.createElement('style');style.textContent='.trade-plan-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:7px;padding:9px}.trade-plan-card{background:var(--panel2);padding:10px;border-top:2px solid var(--gold);min-width:0}.trade-plan-title b,.trade-plan-title small{display:block}.trade-plan-title b{color:var(--text);overflow-wrap:anywhere}.trade-plan-title small,.trade-plan-evidence{color:var(--muted);font-size:11px;line-height:1.5;margin-top:4px}.trade-plan-card>div:not(.trade-plan-title):not(.trade-plan-evidence){font-size:11px;color:var(--muted);line-height:1.5;margin-top:7px}.trade-plan-card strong{color:var(--gold);display:block}.trade-plan-card button{margin-top:8px}@media(max-width:1200px){.trade-plan-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:600px){.trade-plan-grid{grid-template-columns:1fr}}';document.head.appendChild(style)
+}
+'''
+    template = template.replace('</script></body></html>', trade_plan_ui + '</script></body></html>')
     OUT.mkdir(parents=True, exist_ok=True)
     context = {
         "generated_at": generated_at,
