@@ -543,11 +543,13 @@ def build():
         "标普500": [],
         "道琼斯": [],
     }
+    corr_by_asset = {}
     for item in overseas:
         asset = item.get("asset")
         targets = [s for s in sectors if any(k in str(s.get("industry")) for k in sector_keywords.get(asset, []))]
         target_ret = float(pd.to_numeric(pd.Series([s.get("week_ret") for s in targets]), errors="coerce").mean()) if targets else None
         same_corr = lead_corr = None
+        corr_windows = {}
         try:
             hist = pd.read_csv(ROOT / "data" / "overseas_daily.csv")
             hist = hist[hist["asset"] == asset].copy()
@@ -558,6 +560,12 @@ def build():
             if len(joined) >= 5:
                 same_corr = float(joined["overseas"].corr(joined["a_market"]))
                 lead_corr = float(joined["overseas"].shift(1).corr(joined["a_market"]))
+            for window in (5, 20, 60):
+                part = joined.tail(window)
+                if len(part) >= max(5, window // 2):
+                    corr_windows[f"same_corr_{window}"] = float(part["overseas"].corr(part["a_market"]))
+                    corr_windows[f"lead_corr_{window}"] = float(part["overseas"].shift(1).corr(part["a_market"]))
+            corr_by_asset[asset] = corr_windows
         except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
             pass
         ret5 = item.get("ret_5d")
@@ -572,6 +580,8 @@ def build():
         else:
             state = "海外与A股方向暂时一致"
         overseas_conduction.append({"asset": asset, "group": item.get("group"), "ret_5d": ret5, "ret_20d": item.get("ret_20d"), "ret_60d": item.get("ret_60d"), "targets": [s.get("industry") for s in targets[:5]], "target_ret": target_ret, "same_corr_60": same_corr, "lead_corr_60": lead_corr, "state": state, "confidence": "中" if targets and same_corr is not None else "低"})
+    for row in overseas_conduction:
+        row.update(corr_by_asset.get(row.get("asset"), {}))
     flow_frame = pd.DataFrame(flows)
     market_flow_series = []
     rotation_timeline = []
@@ -737,7 +747,9 @@ def build():
 '''
     news_switch_ui = r'''const impactRowsForSwitch=(summary.news_briefs||news).slice().sort((a,b)=>Number(b.value_score||0)-Number(a.value_score||0)).slice(0,12);document.querySelectorAll('#newsImpactMap .impact-item').forEach((el,i)=>{const x=impactRowsForSwitch[i];if(x?.is_macro)el.insertAdjacentHTML('afterbegin',`<small class="macro-badge">宏观类别：${escHtml(x.macro_category||'宏观数据')} · 受益情景：${escHtml(x.macro_benefit_scenarios||'需验证')} · 风险情景：${escHtml(x.macro_risk_scenarios||'需验证')}</small>`)});document.querySelectorAll('#topNewsList .news-brief').forEach((el,i)=>{el.addEventListener('click',e=>{if(e.target.closest('a'))return;showView('newsView');const b=document.querySelector(`#impactNewsSwitcher button[data-impact-index="${i}"]`);b?.click()})});const macroBadgeStyle=document.createElement('style');macroBadgeStyle.textContent='.macro-badge{color:var(--gold)!important;border-left:2px solid var(--gold);padding-left:6px}';document.head.appendChild(macroBadgeStyle)
 '''
-    trade_plan_ui = stock_agent_ui + valuation_ui + etf_share_ui + news_ui + news_switch_ui + r'''
+    overseas_corr_ui = r'''document.querySelectorAll('#overseasList .overseas-item').forEach((el,i)=>{const x=(summary.overseas_conduction||[])[i];if(!x)return;el.insertAdjacentHTML('beforeend',`<small>滚动同步相关：5日 ${fmt(x.same_corr_5,2)} · 20日 ${fmt(x.same_corr_20,2)} · 60日 ${fmt(x.same_corr_60,2)}</small><small>领先1日相关：5日 ${fmt(x.lead_corr_5,2)} · 20日 ${fmt(x.lead_corr_20,2)} · 60日 ${fmt(x.lead_corr_60,2)}</small>`)});
+'''
+    trade_plan_ui = stock_agent_ui + valuation_ui + etf_share_ui + news_ui + news_switch_ui + overseas_corr_ui + r'''
 const tradePlanAnchor=document.querySelector('#overviewView .decision-grid');
 if(tradePlanAnchor&&!document.querySelector('#tradePlanPanel')){
   const panel=document.createElement('section');panel.id='tradePlanPanel';panel.className='panel change-panel';
