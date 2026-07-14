@@ -52,11 +52,59 @@ def score(row):
     return row
 
 
+MACRO_SOURCES = [
+    ("China CPI", "macro_china_cpi_monthly", "https://www.stats.gov.cn/", "inflation"),
+    ("US CPI", "macro_usa_cpi_monthly", "https://www.bls.gov/cpi/", "overseas_inflation"),
+    ("US Core CPI", "macro_usa_core_cpi_monthly", "https://www.bls.gov/cpi/", "overseas_inflation"),
+    ("China repo rate", "repo_rate_query", "http://www.pbc.gov.cn/", "liquidity"),
+    ("China LPR", "macro_china_lpr", "http://www.pbc.gov.cn/", "monetary_policy"),
+    ("US policy rate", "macro_bank_usa_interest_rate", "https://www.federalreserve.gov/", "overseas_rate"),
+]
+
+
+def macro_event(label, function_name, url, category, row):
+    values = {str(k): str(v) for k, v in row.items() if pd.notna(v) and str(v).strip() not in ("", "nan", "None")}
+    if not values:
+        return None
+    date_value = next((v for k, v in values.items() if any(x in k.lower() for x in ("date", "time", "date", "time", "release"))), "")
+    latest = "; ".join(f"{k}: {v}" for k, v in list(values.items())[:8])
+    item = {
+        "time": date_value or str(today), "title": f"Macro | {label}: {latest[:180]}", "content": latest,
+        "source": f"Official macro | {label}", "url": url, "ts_code": "", "name": "", "industry": "Macro policy",
+        "macro_category": category, "is_macro": True, "impact_type": "Indirect", "impact_scope": "Index + sectors + ETF",
+        "impact_strength": "High", "direction": "Neutral pending expectation comparison", "direction_score": 0,
+        "market_acceptance": "Needs price and expectation validation",
+        "validation": "Compare prior value, consensus expectation, index breadth, bond yield and sector relative strength",
+        "reasons": "Official macro release; this dashboard does not infer bullish/bearish direction without a comparable consensus",
+    }
+    item = score(item)
+    item.update({"value_score": 90, "trust_score": 90, "direction_score": 0, "macro_category": category,
+                 "is_macro": True, "score_formula": "Official macro source 90; direction requires prior/consensus and market-price validation"})
+    return item
+
+
+events = []
+macro_events = []
+for label, function_name, url, category in MACRO_SOURCES:
+    try:
+        fn = getattr(ak, function_name)
+        frame = fn()
+        if frame is None or frame.empty:
+            continue
+        frame.to_csv(OUT / f"macro_{function_name}.csv", index=False, encoding="utf-8-sig")
+        event = macro_event(label, function_name, url, category, frame.iloc[-1].to_dict())
+        if event:
+            macro_events.append(event)
+    except Exception as exc:
+        print("FAIL macro", function_name, type(exc).__name__, exc)
+events.extend(macro_events)
+print("MACRO", len(macro_events))
+
+
 basic = pd.read_csv("data/stock_basic.csv", dtype={"symbol": str})
 basic["symbol"] = basic["symbol"].str.zfill(6)
 symbol_map = basic.set_index("symbol").to_dict("index")
 name_rows = basic.loc[basic["name"].str.len() >= 3, ["name", "ts_code", "industry"]].sort_values("name", key=lambda s: s.str.len(), ascending=False).to_dict("records")
-events = []
 
 for date in DATES:
     try:

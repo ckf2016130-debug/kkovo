@@ -393,7 +393,7 @@ def build():
     agent_series = []
     sector_agent_series = {}
     stock_agent_series = {}
-    stock_class = stocks_frame[["ts_code", "circ_mv_yi", "turnover_rate", "U", "Z"]].copy()
+    stock_class = stocks_frame[["ts_code", "industry", "circ_mv_yi", "turnover_rate", "U", "Z"]].copy()
     cap_mid = stocks_frame["circ_mv_yi"].median()
     turn_mid = stocks_frame["turnover_rate"].median()
     for path in sorted((ROOT / "data").glob("moneyflow_*.csv")):
@@ -723,7 +723,9 @@ def build():
     template = template.replace("const sectorAgentBox", stock_agent_ui + "const sectorAgentBox")
     etf_share_ui = r'''const etfShareBox=document.querySelector('#etfBoard');if(etfShareBox&&!document.querySelector('#etfShareEvidence')){const rows=etfs.filter(x=>x.share_change_pct!==null&&x.share_change_pct!==undefined).slice(0,8);etfShareBox.insertAdjacentHTML('beforeend',`<div id="etfShareEvidence" class="source etf-share-evidence"><b>基金份额变化</b>：${rows.length?rows.map(x=>`${escHtml(x.name||x.ts_code)} ${fmt(x.share_change_pct,2)}%`).join(' · '):'接口未返回基金份额变化，无法估算申赎方向'}。该指标是基金份额快照变化，不等于纯申购赎回金额；需结合净值、价格和成交额判断。</div>`);const style=document.createElement('style');style.textContent='.etf-share-evidence{padding:8px;background:var(--panel2);line-height:1.6}.etf-share-evidence b{color:var(--gold)}';document.head.appendChild(style)}
 '''
-    trade_plan_ui = stock_agent_ui + valuation_ui + etf_share_ui + r'''
+    news_ui = r'''const impactMapSection=document.querySelector('.impact-map'),newsView=document.querySelector('#newsView');if(impactMapSection&&newsView&&impactMapSection.parentElement!==newsView)newsView.appendChild(impactMapSection);const impactMap=document.querySelector('#newsImpactMap');if(impactMap&&!document.querySelector('#impactNewsSwitcher')){const sw=document.createElement('div');sw.id='impactNewsSwitcher';sw.className='impact-news-switcher';const rows=(summary.news_briefs||news).slice().sort((a,b)=>Number(b.value_score||0)-Number(a.value_score||0)).slice(0,12);sw.innerHTML='<button class="btn active" data-impact-index="all">全部消息</button>'+rows.slice(0,3).map((x,i)=>`<button class="btn" data-impact-index="${i}">消息${i+1}</button>`).join('');impactMap.parentNode.insertBefore(sw,impactMap);const apply=i=>{impactMap.querySelectorAll('.impact-item').forEach((el,n)=>el.style.display=i===null||n===i?'':'none');sw.querySelectorAll('button').forEach((b,n)=>b.classList.toggle('active',(i===null&&n===0)||(i!==null&&n===i+1)))};sw.querySelectorAll('button').forEach(b=>b.onclick=()=>apply(b.dataset.impactIndex==='all'?null:Number(b.dataset.impactIndex)))}const impactSwitchStyle=document.createElement('style');impactSwitchStyle.textContent='.impact-news-switcher{display:flex;gap:5px;padding:8px 9px;border:1px solid var(--line);border-bottom:0;background:var(--panel);overflow:auto}.impact-news-switcher .btn{white-space:nowrap}';document.head.appendChild(impactSwitchStyle);
+'''
+    trade_plan_ui = stock_agent_ui + valuation_ui + etf_share_ui + news_ui + r'''
 const tradePlanAnchor=document.querySelector('#overviewView .decision-grid');
 if(tradePlanAnchor&&!document.querySelector('#tradePlanPanel')){
   const panel=document.createElement('section');panel.id='tradePlanPanel';panel.className='panel change-panel';
