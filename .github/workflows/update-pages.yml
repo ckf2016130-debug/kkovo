@@ -19,6 +19,7 @@ permissions:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: github-pages
 
@@ -44,23 +45,23 @@ jobs:
       - name: Fetch market data
         env:
           TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
-        run: python fetch_tinyshare_week.py || echo "Market source timeout or authorization lock; previous snapshot will be used"
+        run: timeout 240s python fetch_tinyshare_week.py || echo "Market source timeout or authorization lock; previous snapshot will be used"
 
       - name: Ensure K-line history window
         env:
           TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
-        run: python fetch_tinyshare_history.py || echo "K-line history source timeout; previous history snapshot will be used"
+        run: timeout 240s python fetch_tinyshare_history.py || echo "K-line history source timeout; previous history snapshot will be used"
 
       - name: Fetch overseas market data
-        run: python fetch_overseas.py || echo "Overseas source timeout or failure; previous snapshot will be used"
+        run: timeout 180s python fetch_overseas.py || echo "Overseas source timeout or failure; previous snapshot will be used"
 
       - name: Build rotation and fundamental metrics
-        run: python build_rotation_report.py
+        run: timeout 180s python build_rotation_report.py
 
       - name: Fetch fundamental data
         env:
           TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
-        run: python fetch_tinyshare_fundamentals.py || echo "Fundamental source timeout or authorization lock; previous snapshot will be used"
+        run: timeout 240s python fetch_tinyshare_fundamentals.py || echo "Fundamental source timeout or authorization lock; previous snapshot will be used"
 
       - name: Fetch and score news
         run: timeout 180s python fetch_score_news.py || echo "News source timeout or failure; previous snapshot will be used"
