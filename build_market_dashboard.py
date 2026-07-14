@@ -77,7 +77,19 @@ def load_etfs():
             component = pd.concat(component_rows, ignore_index=True)
             component_summary = component.groupby("ts_code", as_index=False).agg(component_count=("con_code", "nunique"), cpr_mean=("cpr", "mean"))
             out = out.merge(component_summary, on="ts_code", how="left")
-        return records(out[[c for c in ["ts_code", "name", "fund_type", "benchmark", "invest_type", "issue_amount", "trade_date", "close", "week_ret", "amount_yi", "nav_date", "unit_nav", "accum_nav", "net_asset", "premium_discount", "component_count", "cpr_mean"] if c in out]])
+        def classify_etf(row):
+            text = f"{row.get('name') or ''} {row.get('benchmark') or ''} {row.get('invest_type') or ''}"
+            if any(k in text for k in ["纳斯达克", "标普", "日经", "恒生", "台湾", "韩国", "海外", "QDII"]):
+                return "海外联动"
+            if any(k in text for k in ["沪深300", "中证500", "中证1000", "中证A500", "上证50", "科创50", "创业板", "国证2000"]):
+                return "宽基工具"
+            if any(k in text for k in ["半导体", "芯片", "人工智能", "计算机", "通信", "医药", "新能源", "军工", "证券", "银行", "红利", "消费"]):
+                return "行业/风格工具"
+            return "主题待确认"
+        out["tool_role"] = out.apply(classify_etf, axis=1)
+        out["tool_relevance_score"] = (pd.to_numeric(out["amount_yi"], errors="coerce").clip(lower=0, upper=20) / 20 * 50 + out["benchmark"].fillna("").astype(str).str.len().clip(upper=20) / 20 * 20).round(1)
+        out["selection_reason"] = out.apply(lambda r: f"{r['tool_role']}；成交额 {float(r['amount_yi']):.2f}亿" if pd.notna(r.get("amount_yi")) else f"{r['tool_role']}；成交额缺失", axis=1)
+        return records(out[[c for c in ["ts_code", "name", "fund_type", "benchmark", "invest_type", "issue_amount", "trade_date", "close", "week_ret", "amount_yi", "nav_date", "unit_nav", "accum_nav", "net_asset", "premium_discount", "component_count", "cpr_mean", "tool_role", "tool_relevance_score", "selection_reason"] if c in out]])
     except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
         return []
 
