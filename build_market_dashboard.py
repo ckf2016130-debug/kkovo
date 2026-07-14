@@ -443,7 +443,7 @@ def build():
             if value > 0:
                 proxy_links.append({"source": agent["name"], "target": sector.get("industry"), "value": round(value, 2)})
     proxy_links = sorted(proxy_links, key=lambda x: x["value"], reverse=True)[:16]
-    rotation_paths = [{"from": s.get("industry"), "to": t.get("industry"), "value": round(min(abs(float(s.get("net_mf_yi") or 0)), abs(float(t.get("net_mf_yi") or 0))), 2), "confidence": "中"} for s, t in zip(top_out, top_in)]
+    rotation_paths = [{"from": s.get("industry"), "to": t.get("industry"), "value": round(min(abs(float(s.get("net_mf_yi") or 0)), abs(float(t.get("net_mf_yi") or 0))), 2), "from_flow": round(float(s.get("net_mf_yi") or 0), 2), "to_flow": round(float(t.get("net_mf_yi") or 0), 2), "confidence": "中" if float(s.get("net_mf_yi") or 0) < 0 and float(t.get("net_mf_yi") or 0) > 0 else "低", "basis": "同一窗口板块净流出与净流入按规模配对，仅为迁移推测，不代表账户资金逐笔转移"} for s, t in zip(top_out, top_in)]
     strongest = max(sectors, key=lambda x: float(x.get("strength") or 0), default={})
     rotation_candidates = [x for x in sectors if x.get("state") == "潜在轮动方向"]
     trade_sector = max(rotation_candidates or sectors, key=lambda x: float(x.get("trade_value_score") or 0), default={})
