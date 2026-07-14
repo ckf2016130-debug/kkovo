@@ -522,6 +522,18 @@ def build():
             benefit, risk = macro_profiles.get(category, ("需结合数据方向确认", "需结合数据方向确认"))
             brief.update({"is_macro": True, "macro_category": category, "industry": "宏观政策", "impact_type": "间接影响（宏观情景映射）", "impact_scope": "指数+风格+板块+ETF（情景映射）", "affected_stock": None, "affected_etf": None, "macro_benefit_scenarios": benefit, "macro_risk_scenarios": risk, "validation": raw.get("validation") or "比较前值与一致预期，再观察指数宽度、利率、相关板块和 ETF 是否同步"})
             brief["impact_chain"] = [{"stage": "宏观数据", "value": raw.get("title"), "evidence": f"发布/数据日期：{raw.get('time') or '未知'} · 来源：{raw.get('source') or '未知'}"}, {"stage": "受益情景", "value": benefit, "evidence": "仅为传导假设，需价格和资金验证"}, {"stage": "受损情景", "value": risk, "evidence": "仅为传导假设，需价格和资金验证"}, {"stage": "验证", "value": "等待下一交易日或预期差确认", "evidence": brief.get("validation") or "暂无"}]
+    for brief in news_briefs:
+        if brief.get("is_macro") is True:
+            continue
+        target = brief.get("industry") or "未映射板块"
+        direction = brief.get("direction") or "中性"
+        if direction == "偏利好":
+            benefit, risk = f"{target}相关龙头、中军和匹配ETF（情景受益）", f"高位拥挤、提前交易或利好兑现（情景风险）"
+        elif direction == "偏利空":
+            benefit, risk = f"防御或替代方向（情景受益，需重新识别）", f"{target}相关龙头、中军和匹配ETF（情景风险）"
+        else:
+            benefit, risk = f"{target}相关资产（中性待验证）", "方向不明，暂不把消息当作交易驱动"
+        brief.update({"benefit_scenarios": benefit, "risk_scenarios": risk})
     chain_head = news_briefs[0] if news_briefs else None
     overseas_lead = next((x for x in overseas if x.get("targets")), None)
     logic_chain = [{"label": "国内消息", "value": chain_head.get("title") if chain_head else "暂无高价值消息", "evidence": f"时间 {chain_head.get('time')} · 价值 {chain_head.get('value_score')} · 可信度 {chain_head.get('trust_score')}" if chain_head else "暂无真实消息", "action": "news", "url": chain_head.get("url") if chain_head else None}]
@@ -750,7 +762,9 @@ def build():
 '''
     overseas_corr_ui = r'''document.querySelectorAll('#overseasList .overseas-item').forEach((el,i)=>{const x=(summary.overseas_conduction||[])[i];if(!x)return;el.insertAdjacentHTML('beforeend',`<small>滚动同步相关：5日 ${fmt(x.same_corr_5,2)} · 20日 ${fmt(x.same_corr_20,2)} · 60日 ${fmt(x.same_corr_60,2)}</small><small>领先1日相关：5日 ${fmt(x.lead_corr_5,2)} · 20日 ${fmt(x.lead_corr_20,2)} · 60日 ${fmt(x.lead_corr_60,2)}</small>`)});
 '''
-    trade_plan_ui = stock_agent_ui + valuation_ui + etf_share_ui + news_ui + news_switch_ui + overseas_corr_ui + r'''
+    news_detail_ui = r'''const topNewsRows=(summary.news_briefs||[]);document.querySelectorAll('#topNewsList .news-brief').forEach((el,i)=>{const x=topNewsRows[i];if(!x)return;el.insertAdjacentHTML('beforeend',`<small>影响范围：${escHtml(x.impact_scope||'暂无')} · 市场认可：${escHtml(x.market_acceptance||'待验证')}</small><small>受益情景：${escHtml(x.is_macro?x.macro_benefit_scenarios:x.benefit_scenarios||'待验证')}</small><small>风险情景：${escHtml(x.is_macro?x.macro_risk_scenarios:x.risk_scenarios||'待验证')}</small><small>观察对象：${escHtml(x.affected_stock||'暂无个股')} · ${escHtml(x.affected_etf||'暂无ETF')}</small>`)});
+'''
+    trade_plan_ui = stock_agent_ui + valuation_ui + etf_share_ui + news_ui + news_switch_ui + news_detail_ui + overseas_corr_ui + r'''
 const tradePlanAnchor=document.querySelector('#overviewView .decision-grid');
 if(tradePlanAnchor&&!document.querySelector('#tradePlanPanel')){
   const panel=document.createElement('section');panel.id='tradePlanPanel';panel.className='panel change-panel';
