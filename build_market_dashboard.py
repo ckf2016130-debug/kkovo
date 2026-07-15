@@ -508,10 +508,10 @@ def build():
         "reverse": "反向因素：若资金广度继续下降、强势板块由流入转流出，当前判断失效。",
     }
     sector_map = {x.get("industry"): x for x in sectors}
-    news_top = sorted(news, key=lambda x: float(x.get("value_score") or 0), reverse=True)[:3]
-    macro_top = next((x for x in sorted(news, key=lambda x: float(x.get("value_score") or 0), reverse=True) if x.get("is_macro") is True), None)
-    if macro_top and not any(x.get("is_macro") is True for x in news_top):
-        news_top = (news_top[:2] + [macro_top])[:3]
+    ranked_news = sorted(news, key=lambda x: float(x.get("value_score") or 0), reverse=True)
+    macro_top = [x for x in ranked_news if x.get("is_macro") is True][:2]
+    company_top = next((x for x in ranked_news if x.get("is_macro") is not True), None)
+    news_top = sorted(([company_top] if company_top else []) + macro_top, key=lambda x: float(x.get("value_score") or 0), reverse=True)[:3]
     news_briefs = []
     for item in news_top:
         direction_score = float(item.get("direction_score") or 0)
@@ -529,6 +529,8 @@ def build():
             acceptance = "相关但尚不能确认市场认可"
         else:
             acceptance = "缺少对应板块价格与资金证据"
+        if item.get("is_macro") is True:
+            acceptance = item.get("market_acceptance") or acceptance
         affected_stock = item.get("name") or None
         if not affected_stock and industry in stocks_frame.get("industry", pd.Series(dtype=str)).values:
             candidates = stocks_frame[stocks_frame["industry"] == industry].sort_values("leader_score", ascending=False)
@@ -546,7 +548,7 @@ def build():
         harmed_objects = f"{object_text}；ETF：{affected_etf or '暂无映射'}" if direction != "偏利好" else f"{object_text}；ETF：{affected_etf or '暂无映射'}（警惕提前交易或兑现）"
         scope = "个股+板块+ETF" if direct and affected_etf else "板块+ETF观察" if affected_etf else "个股+所属板块" if direct else "板块观察"
         impact_strength = "高" if float(item.get("value_score") or 0) >= 75 else "中" if float(item.get("value_score") or 0) >= 50 else "低"
-        impact = {"impact_type": "直接影响" if direct else "间接映射", "impact_scope": scope, "impact_strength": impact_strength, "duration": "持续性待验证（当前快照不推断时间长度）", "pre_traded": "无法仅凭当前快照确认是否提前交易", "consumption": "当前快照无法确认，需结合消息前后价格、成交额和资金" if sector else "暂无可验证价格窗口", "market_acceptance": acceptance, "sector_ret": sector_ret, "sector_flow": sector_flow, "validation": f"验证：{industry}次日资金、龙头/中军与 ETF 是否同步。" if sector else "验证：先补充可映射的板块或标的。", "affected_stock": affected_stock, "affected_etf": affected_etf}
+        impact = {"impact_type": item.get("impact_type") if item.get("is_macro") is True else "直接影响" if direct else "间接映射", "impact_scope": item.get("impact_scope") if item.get("is_macro") is True else scope, "impact_strength": impact_strength, "duration": "持续性待验证（当前快照不推断时间长度）", "pre_traded": "无法仅凭当前快照确认是否提前交易", "consumption": "当前快照无法确认，需结合消息前后价格、成交额和资金" if sector else "暂无可验证价格窗口", "market_acceptance": acceptance, "sector_ret": sector_ret, "sector_flow": sector_flow, "validation": item.get("validation") if item.get("is_macro") is True else f"验证：{industry}次日资金、龙头/中军与 ETF 是否同步。" if sector else "验证：先补充可映射的板块或标的。", "affected_stock": affected_stock, "affected_etf": affected_etf}
         impact["impact_chain"] = [{"stage": "消息", "value": item.get("title"), "evidence": f"{item.get('time') or '时间未知'} · 来源 {item.get('source') or '未知'}"}, {"stage": "板块", "value": industry, "evidence": f"影响类型：{impact['impact_type']} · 强度：{impact_strength}"}, {"stage": "资金", "value": industry if sector else "暂无映射", "evidence": f"5日主力净流 {sector_flow:.2f}亿" if sector_flow is not None else "暂无真实资金证据"}, {"stage": "价格", "value": f"{sector_ret:.2f}%" if sector_ret is not None else "暂无价格证据", "evidence": "当前窗口表现，不等于消息因果"}, {"stage": "标的", "value": affected_stock or affected_etf or "暂无映射", "evidence": "个股/ETF仅作观察对象，不代表交易建议"}, {"stage": "验证", "value": "待下一交易日确认", "evidence": impact["validation"]}]
         item.update(impact)
         news_briefs.append({"title": item.get("title"), "url": item.get("url"), "source": item.get("source"), "time": item.get("time"), "industry": industry, "name": affected_stock, "direction": direction, "value_score": item.get("value_score"), "trust_score": item.get("trust_score"), "score_breakdown": item.get("score_breakdown"), "score_formula": item.get("score_formula"), "reason": item.get("reasons"), "beneficiary_objects": beneficiary_objects, "harmed_objects": harmed_objects, **impact})
@@ -555,7 +557,7 @@ def build():
         if raw.get("is_macro") is True:
             category = raw.get("macro_category")
             benefit, risk = macro_profiles.get(category, ("需结合数据方向确认", "需结合数据方向确认"))
-            brief.update({"is_macro": True, "macro_category": category, "industry": "宏观政策", "impact_type": "间接影响（宏观情景映射）", "impact_scope": "指数+风格+板块+ETF（情景映射）", "affected_stock": None, "affected_etf": None, "macro_benefit_scenarios": benefit, "macro_risk_scenarios": risk, "validation": raw.get("validation") or "比较前值与一致预期，再观察指数宽度、利率、相关板块和 ETF 是否同步"})
+            brief.update({"is_macro": True, "macro_category": category, "industry": "宏观政策", "impact_type": raw.get("impact_type") or "间接影响（宏观情景映射）", "impact_scope": raw.get("impact_scope") or "指数+风格+板块+ETF（情景映射）", "affected_stock": None, "affected_etf": None, "macro_benefit_scenarios": raw.get("macro_benefit_scenarios") or benefit, "macro_risk_scenarios": raw.get("macro_risk_scenarios") or risk, "validation": raw.get("validation") or "比较前值与一致预期，再观察指数宽度、利率、相关板块和 ETF 是否同步"})
             brief["impact_chain"] = [{"stage": "宏观数据", "value": raw.get("title"), "evidence": f"发布/数据日期：{raw.get('time') or '未知'} · 来源：{raw.get('source') or '未知'}"}, {"stage": "受益情景", "value": benefit, "evidence": "仅为传导假设，需价格和资金验证"}, {"stage": "受损情景", "value": risk, "evidence": "仅为传导假设，需价格和资金验证"}, {"stage": "验证", "value": "等待下一交易日或预期差确认", "evidence": brief.get("validation") or "暂无"}]
     for brief in news_briefs:
         if brief.get("is_macro") is True:
