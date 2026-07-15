@@ -185,8 +185,10 @@ def load_active_concepts():
             raise KeyError("missing concept code/name")
         for column in ["pct_change", "net_buy_amount", "net_sell_amount", "net_amount", "company_num", "pct_change_stock"]:
             flow[column] = pd.to_numeric(flow.get(column), errors="coerce")
-        flow["activity_score"] = flow["net_amount"].abs().fillna(0) + flow["pct_change"].abs().fillna(0) * 5
-        flow = flow.sort_values("activity_score", ascending=False).drop_duplicates("ts_code").head(24)
+        generic = flow["name"].fillna("").astype(str).str.contains("融资融券|沪股通|深股通|标普道琼斯|MSCI|富时罗素|同花顺漂亮|同花顺出海", regex=True)
+        company_scale = flow["company_num"].clip(lower=1).pow(0.5)
+        flow["activity_score"] = flow["net_amount"].abs().fillna(0) / company_scale + flow["pct_change"].abs().fillna(0) * 10
+        flow = flow[~generic].sort_values("activity_score", ascending=False).drop_duplicates("ts_code").head(24)
     except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
         return [], {}, {"available": False, "reason": "概念资金快照字段不完整"}
 
@@ -240,14 +242,14 @@ def load_active_concepts():
         rank_map = {str(row.get("ts_code")): index for index, row in enumerate(flow.to_dict("records"))}
         name_map = {str(row.get("ts_code")): str(row.get("name") or "") for row in flow.to_dict("records")}
         for stock_code, group in members.groupby("con_code", sort=False):
-            codes = sorted(set(group["concept_code"].astype(str)), key=lambda code: rank_map.get(code, 9999))[:6]
+            codes = sorted(set(group["concept_code"].astype(str)), key=lambda code: rank_map.get(code, 9999))[:3]
             stock_concepts[str(stock_code)] = [{"code": code, "name": name_map.get(code) or code} for code in codes]
     meta = {
         "available": bool(active),
         "trade_date": active[0].get("trade_date") if active else None,
         "active_count": len(active),
         "mapped_stock_count": len(stock_concepts),
-        "coverage_note": "概念行情覆盖当日活跃排名；成分映射仅覆盖资金与涨跌活跃度前16个概念，不代表全市场概念全集。",
+        "coverage_note": "概念行情按单位覆盖规模资金强度与涨跌活跃度排序，并排除融资融券、沪深股通等通用标签；成分映射仅覆盖排名前16个概念，不代表全市场概念全集。",
     }
     return active, stock_concepts, meta
 
@@ -1215,6 +1217,7 @@ def build():
     template = template.replace("slice(0,2)||'other'", "slice(0,4)||'other'")
     template = template.replace(".stock-side{padding:14px}", ".stock-side{padding:14px;height:calc(100% - 39px);overflow:auto}")
     template = template.replace("强势延续", "强势板块延续").replace("潜在轮入", "潜在轮动方向").replace("上涨分歧", "上涨但资金背离")
+    template = template.replace("前十大权重", "前十大估算权重").replace("行业暴露前五", "A股篮子行业暴露")
     template = template.replace("${escHtml(x.basis||'')} · 覆盖 ${fmt(x.coverage,0)} 只", "${escHtml(x.basis||'')} · ${escHtml(x.window||'可用窗口')} · 覆盖 ${fmt(x.coverage,0)} 只")
     stock_history = {}
     for row in prices:

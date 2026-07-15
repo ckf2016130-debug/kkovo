@@ -38,8 +38,11 @@ def fetch_active_concepts(pro, trade_date, start_date, end_date):
         flow = pd.read_csv(flow_path)
         flow["net_amount"] = pd.to_numeric(flow.get("net_amount"), errors="coerce")
         flow["pct_change"] = pd.to_numeric(flow.get("pct_change"), errors="coerce")
-        ranked = flow.assign(
-            activity_score=flow["net_amount"].abs().fillna(0) + flow["pct_change"].abs().fillna(0) * 5
+        flow["company_num"] = pd.to_numeric(flow.get("company_num"), errors="coerce").clip(lower=1)
+        generic = flow["name"].fillna("").astype(str).str.contains("融资融券|沪股通|深股通|标普道琼斯|MSCI|富时罗素|同花顺漂亮|同花顺出海", regex=True)
+        ranked = flow[~generic].assign(
+            activity_score=flow.loc[~generic, "net_amount"].abs().fillna(0) / flow.loc[~generic, "company_num"].pow(0.5)
+            + flow.loc[~generic, "pct_change"].abs().fillna(0) * 10
         ).sort_values("activity_score", ascending=False)
         active = ranked.dropna(subset=["ts_code"]).drop_duplicates("ts_code").head(16)
     except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError) as exc:
