@@ -272,7 +272,15 @@ def build():
             continue
     index_frame = pd.concat(index_rows, ignore_index=True) if index_rows else pd.DataFrame()
     news_path = ROOT / "data" / "news" / "news_scored.csv"
-    news = records(pd.read_csv(news_path)) if news_path.exists() else []
+    if news_path.exists():
+        news_frame = pd.read_csv(news_path)
+        news_frame["value_score"] = pd.to_numeric(news_frame.get("value_score"), errors="coerce")
+        news_frame["time"] = news_frame.get("time", "").fillna("").astype(str)
+        news_frame = news_frame.sort_values(["value_score", "time"], ascending=[False, False]).head(400)
+        news_frame = news_frame.drop(columns=["content", "retrieved_at", "score_breakdown", "score_formula"], errors="ignore")
+        news = records(news_frame)
+    else:
+        news = []
     numeric_stocks = pd.to_numeric(pd.Series([x.get("week_ret") for x in stocks]), errors="coerce").dropna()
     generated_at = pd.Timestamp.now(tz="Asia/Shanghai").isoformat(timespec="seconds")
     history_path = ROOT / "data" / "decision_history.json"
@@ -430,6 +438,22 @@ def build():
         sector["agent_series"] = sector_agent_series.get(str(sector.get("industry")), [])
     for stock in stocks:
         stock["agent_series"] = stock_agent_series.get(str(stock.get("ts_code")), [])
+    price_frame = pd.DataFrame(prices)
+    if not price_frame.empty:
+        price_frame["trade_date"] = price_frame["trade_date"].astype(str)
+        price_frame["close"] = pd.to_numeric(price_frame["close"], errors="coerce")
+        latest_prices = price_frame.dropna(subset=["close"]).sort_values(["ts_code", "trade_date"]).drop_duplicates("ts_code", keep="last").set_index("ts_code")["close"].to_dict()
+        for stock in stocks:
+            stock["latest_price"] = latest_prices.get(stock.get("ts_code"))
+        industry_lookup = stocks_frame[["ts_code", "industry"]].drop_duplicates("ts_code")
+        sector_prices = price_frame.merge(industry_lookup, on="ts_code", how="left").dropna(subset=["industry", "close"])
+        sector_prices = sector_prices.groupby(["industry", "trade_date"], as_index=False)["close"].median()
+        sector_price_map = {
+            str(industry): [[str(row.trade_date), round(float(row.close), 4)] for row in group.itertuples()]
+            for industry, group in sector_prices.sort_values("trade_date").groupby("industry", sort=False)
+        }
+        for sector in sectors:
+            sector["price_series"] = sector_price_map.get(str(sector.get("industry")), [])
     flow_values = pd.to_numeric(pd.Series([x.get("net_mf_yi") for x in sectors]), errors="coerce")
     flow_rank = flow_values.rank(pct=True).fillna(0.5) * 100
     for sector, rank in zip(sectors, flow_rank.tolist()):
@@ -766,16 +790,40 @@ def build():
     except OSError:
         pass
     template = (ROOT / "market_dashboard_template.html").read_text(encoding="utf-8")
+    template = template.replace("slice(0,2)||'other'", "slice(0,4)||'other'")
     template = template.replace("强势延续", "强势板块延续").replace("潜在轮入", "潜在轮动方向").replace("上涨分歧", "上涨但资金背离")
+    stock_history = {}
+    for row in prices:
+        code = str(row.get("ts_code") or "")
+        if not code:
+            continue
+        item = stock_history.setdefault(code, {"p": [], "f": [], "a": []})
+        item["p"].append([row.get("trade_date"), row.get("open"), row.get("high"), row.get("low"), row.get("close"), row.get("vol"), row.get("amount"), row.get("pct_chg")])
+    for row in stock_flows:
+        code = str(row.get("ts_code") or "")
+        if not code:
+            continue
+        stock_history.setdefault(code, {"p": [], "f": [], "a": []})["f"].append([row.get("trade_date"), row.get("net_mf_yi")])
+    for stock in stocks:
+        code = str(stock.get("ts_code") or "")
+        item = stock_history.setdefault(code, {"p": [], "f": [], "a": []})
+        item["a"] = [[row.get("trade_date"), row.get("name"), row.get("value")] for row in stock.get("agent_series", [])]
+        stock.pop("agent_series", None)
+    history_shards = {}
+    for code, item in stock_history.items():
+        digits = "".join(ch for ch in code if ch.isdigit())
+        shard = digits[:4] or "other"
+        history_shards.setdefault(shard, {})[code] = item
+    display_etfs = [x for x in etfs if x.get("tool_role") != "主题待确认" and float(x.get("tool_relevance_score") or 0) >= 45][:24]
     replacements = {
         "__SECTORS__": json.dumps(sectors, ensure_ascii=False, separators=(",", ":")),
         "__STOCKS__": json.dumps(stocks, ensure_ascii=False, separators=(",", ":")),
         "__FLOWS__": json.dumps(flows, ensure_ascii=False, separators=(",", ":")),
-        "__PRICES__": json.dumps(prices, ensure_ascii=False, separators=(",", ":")),
+        "__PRICES__": "[]",
         "__SUMMARY__": json.dumps(summary, ensure_ascii=False, separators=(",", ":")),
         "__NEWS__": json.dumps(news, ensure_ascii=False, separators=(",", ":")),
-        "__ETFS__": json.dumps(etfs, ensure_ascii=False, separators=(",", ":")),
-        "__STOCK_FLOWS__": json.dumps(stock_flows, ensure_ascii=False, separators=(",", ":")),
+        "__ETFS__": json.dumps(display_etfs, ensure_ascii=False, separators=(",", ":")),
+        "__STOCK_FLOWS__": "[]",
     }
     for key, value in replacements.items():
         template = template.replace(key, value)
@@ -798,6 +846,7 @@ def build():
 '''
     stock_final_ui = r'''const finalStockOverlay=()=>{const x=selectedStock,p=prices.filter(v=>v.ts_code===x.ts_code).sort((a,b)=>String(a.trade_date).localeCompare(String(b.trade_date)));if(!p.length)return;const close=p.map(v=>Number(v.close)).filter(Number.isFinite),current=close.at(-1),window=p.slice(-60),distinct=(values,ascending)=>{const out=[];for(const v of [...values].sort((a,b)=>ascending?a-b:b-a)){if(!out.some(z=>Math.abs(z-v)/Math.max(Math.abs(z),1)<.012))out.push(Number(v.toFixed(2)))}return out};const lows=[],highs=[];for(let i=2;i<p.length-2;i++){const lo=Number(p[i].low),hi=Number(p[i].high);if(Number.isFinite(lo)&&[p[i-2],p[i-1],p[i+1],p[i+2]].every(v=>lo<=Number(v.low)))lows.push(lo);if(Number.isFinite(hi)&&[p[i-2],p[i-1],p[i+1],p[i+2]].every(v=>hi>=Number(v.high)))highs.push(hi)}const recentLow=Math.min(...window.map(v=>Number(v.low)).filter(Number.isFinite)),recentHigh=Math.max(...window.map(v=>Number(v.high)).filter(Number.isFinite)),supports=distinct(lows.filter(v=>v<current),false).slice(0,3),resistances=distinct(highs.filter(v=>v>current),true).slice(0,3);if(!supports.length&&Number.isFinite(recentLow)&&recentLow<current)supports.push(Number(recentLow.toFixed(2)));if(!resistances.length&&Number.isFinite(recentHigh)&&recentHigh>current)resistances.push(Number(recentHigh.toFixed(2)));const s1=supports[0],r1=resistances[0],risk=Number.isFinite(s1)?Math.max(0,current-s1):null,reward=Number.isFinite(r1)?Math.max(0,r1-current):null,rr=risk&&reward?reward/risk:null;stockChart.setOption({series:[{markLine:{silent:true,symbol:['none','none'],data:[...supports.map((v,i)=>({yAxis:v,name:`支撑${i+1}`})),...resistances.map((v,i)=>({yAxis:v,name:`压力${i+1}`}))],label:{color:C.gold}}}]});const box=document.querySelector('#tradeLevels');if(box)box.innerHTML=`<div class="trade-level-grid"><div><span>当前价</span><b>${fmt(current)}</b></div><div><span>支撑位1 / 2 / 3</span><b>${supports.map(fmt).join(' / ')||'—'}</b></div><div><span>压力位1 / 2 / 3</span><b>${resistances.map(fmt).join(' / ')||'—'}</b></div><div><span>最近压力空间</span><b>${reward!=null?fmt(reward/current*100)+'%':'—'}</b></div><div><span>最近支撑风险</span><b>${risk!=null?fmt(risk/current*100)+'%':'—'}</b></div><div><span>观察盈亏比</span><b>${rr!=null?fmt(rr,2):'—'}</b></div></div><small class="source">支撑/压力取近60个交易日的真实局部高低点，并按1.2%邻近价位去重；不足时回退到近60日区间边界。它们是观察区间，不是保证反转的价格。</small>`;const decision=document.querySelector('#stockDecision');if(decision){const aligned=selectedStock.industry===summary.trade_sector||selectedStock.industry===summary.strongest_sector,sync=Number(selectedStock.week_ret)>0&&Number(selectedStock.net_mf_5d_yi)>0?'价格与5日资金同步':Number(selectedStock.week_ret)>0?'上涨但资金未确认':Number(selectedStock.net_mf_5d_yi)>0?'下跌但资金承接':'价格与资金未同步';decision.innerHTML=`<b>交易判断摘要：${aligned?'属于当前主线观察范围':'不属于当前主线优先范围'}</b><br><small>价格/资金：${sync}。${rr!=null&&rr>=1.5?'位置赔率尚可，仍需等验证。':'距离压力较近或支撑证据不足，优先等待。'}</small><br><small>继续观察条件：所属板块资金保持正向，且龙头/中军与该股相对强弱同步。</small><br><small>失效条件：跌破支撑1并伴随资金转负，或板块状态转弱；不构成买卖指令。</small>`}};const priorFinalRenderStock=renderStock;renderStock=function(){priorFinalRenderStock();finalStockOverlay()};finalStockOverlay();
 '''
+    stock_final_ui = stock_final_ui.replace("支撑/压力取近60个交易日的真实局部高低点", "支撑/压力取最近 ${window.length} 个交易日的真实局部高低点").replace("不足时回退到近60日区间边界", "不足时回退到当前加载区间边界")
     news_link_ui = r'''document.querySelectorAll('#topNewsList .news-brief a[href="#"]').forEach(a=>{const span=document.createElement('span');span.textContent=a.textContent;a.replaceWith(span)});const logicStockLinks=document.querySelectorAll('#logicChainList .logic-node[data-action="stock"]');logicStockLinks.forEach(node=>node.addEventListener('click',()=>node.dataset.target&&selectStock(node.dataset.target,true)));const newsLinkStyle=document.createElement('style');newsLinkStyle.textContent='#topNewsList .news-brief a{color:var(--text);text-decoration:none}#topNewsList .news-brief a:hover{color:var(--gold);text-decoration:underline}#topNewsList .news-brief b>span{cursor:pointer}';document.head.appendChild(newsLinkStyle)
 '''
     etf_detail_ui = r'''const etfDetailHost=document.querySelector('#etfBoard');if(etfDetailHost&&!document.querySelector('#etfSelectedEvidence')){const detail=document.createElement('div');detail.id='etfSelectedEvidence';detail.className='etf-selected-evidence';const renderEtfDetail=i=>{const x=etfs[i]||etfs[0];if(!x)return;const exposure=(x.industry_exposure||[]).slice(0,5).map(v=>`${escHtml(v.industry)} ${fmt(v.weight,1)}%`).join(' · ')||'未提供行业权重';const overseasText=x.overseas_asset?`${escHtml(x.overseas_asset)} · 5日 ${fmt(x.overseas_ret_5d)}% · 20日 ${fmt(x.overseas_ret_20d)}%`:'暂无可验证海外联动';detail.innerHTML=`<div class="etf-selected-title">ETF观察证据 <small>${escHtml(x.name||x.ts_code||'')}</small></div><div class="etf-selected-grid"><div><span>观察理由</span><b>${escHtml(x.selection_reason||x.tool_role||'暂无')}</b></div><div><span>跟踪基准</span><b>${escHtml(x.benchmark||'未提供')}</b></div><div><span>收盘 / 窗口涨跌</span><b>${fmt(x.close)} / ${fmt(x.week_ret)}%</b></div><div><span>成交额 / 溢折价</span><b>${fmt(x.amount_yi)}亿 / ${fmt(x.premium_discount)}%</b></div><div><span>成分数 / 前十大权重</span><b>${fmt(x.component_count,0)} / ${fmt(x.top10_weight,1)}%</b></div><div><span>基金份额变化</span><b>${fmt(x.share_change_pct,2)}%</b></div><div><span>行业暴露前五</span><b>${exposure}</b></div><div><span>海外联动</span><b>${overseasText}</b></div></div><small class="source">ETF只作为指数、行业和流动性观察工具；成交额不等于申赎资金，份额变化也不等于纯申购赎回。溢折价、流动性或跟踪关系异常时，停止把它作为对应方向的替代观察。</small>`;};document.querySelectorAll('#etfBoard tbody tr').forEach((row,i)=>{row.dataset.etfIndex=i;row.addEventListener('click',()=>{document.querySelectorAll('#etfBoard tbody tr').forEach(r=>r.classList.remove('etf-selected-row'));row.classList.add('etf-selected-row');renderEtfDetail(i)})});renderEtfDetail(0);const style=document.createElement('style');style.textContent='.etf-selected-evidence{margin-top:9px;padding:10px;background:var(--panel2);border-top:2px solid var(--gold)}.etf-selected-title{font-weight:700;color:var(--gold);margin-bottom:7px}.etf-selected-title small{color:var(--text);margin-left:8px}.etf-selected-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}.etf-selected-grid>div{padding:6px;background:var(--panel)}.etf-selected-grid span,.etf-selected-grid b{display:block}.etf-selected-grid span{color:var(--muted);font-size:10px}.etf-selected-grid b{font-size:11px;line-height:1.45;overflow-wrap:anywhere}.etf-selected-row{background:#263442!important;outline:1px solid var(--gold)}@media(max-width:900px){.etf-selected-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}';document.head.appendChild(style)}
@@ -822,6 +871,12 @@ const agentCurrentStyle=document.createElement('style');agentCurrentStyle.textCo
 ''' + etf_observer_ui
     template = template.replace('</script></body></html>', trade_plan_ui + '</script></body></html>')
     OUT.mkdir(parents=True, exist_ok=True)
+    history_out = OUT / "history"
+    history_out.mkdir(exist_ok=True)
+    for stale in history_out.glob("*.json"):
+        stale.unlink()
+    for shard, payload in history_shards.items():
+        (history_out / f"{shard}.json").write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     context = {
         "generated_at": generated_at,
         "source": summary["source"],
