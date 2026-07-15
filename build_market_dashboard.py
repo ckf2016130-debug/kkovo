@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -719,6 +720,117 @@ def build():
     macro_top = [x for x in ranked_news if x.get("is_macro") is True][:2]
     company_top = next((x for x in ranked_news if x.get("is_macro") is not True), None)
     news_top = sorted(([company_top] if company_top else []) + macro_top, key=lambda x: float(x.get("value_score") or 0), reverse=True)[:3]
+    macro_profiles = {"inflation": ("周期/资源、金融", "高估值成长、消费"), "overseas_inflation": ("价值、防御", "海外敏感成长"), "liquidity": ("宽基、金融、地产链", "高杠杆与高估值方向"), "monetary_policy": ("利率敏感资产", "利率上行敏感方向"), "overseas_rate": ("美元/利率受益方向", "高估值成长、外资敏感方向")}
+    price_history_by_code = {}
+    for row in prices:
+        code = str(row.get("ts_code") or "")
+        if code:
+            price_history_by_code.setdefault(code, []).append(row)
+    for rows in price_history_by_code.values():
+        rows.sort(key=lambda x: str(x.get("trade_date") or ""))
+
+    def finite_number(value):
+        try:
+            number = float(value)
+            return number if math.isfinite(number) else None
+        except (TypeError, ValueError):
+            return None
+
+    def stock_reference(row, relation, tier):
+        if row is None:
+            return None
+        return {
+            "name": row.get("name"),
+            "ts_code": row.get("ts_code"),
+            "relation": relation,
+            "tier": tier,
+            "week_ret": finite_number(row.get("week_ret")),
+            "net_mf_5d_yi": finite_number(row.get("net_mf_5d_yi")),
+            "pe": finite_number(row.get("pe")),
+            "pb": finite_number(row.get("pb")),
+            "revenue_yoy": finite_number(row.get("q_sales_yoy")),
+            "profit_yoy": finite_number(row.get("netprofit_yoy")),
+            "fundamental_coverage": finite_number(row.get("fundamental_coverage")),
+        }
+
+    def sector_roles(industry):
+        if not industry or stocks_frame.empty or industry not in stocks_frame.get("industry", pd.Series(dtype=str)).values:
+            return []
+        frame = stocks_frame[stocks_frame["industry"] == industry].copy()
+        roles = []
+        used = set()
+        for label, score in (("龙头", "leader_score"), ("中军", "core_score"), ("跟随/弹性", "elastic_score")):
+            if score not in frame:
+                continue
+            ranked = frame[~frame["ts_code"].astype(str).isin(used)].sort_values(score, ascending=False)
+            if ranked.empty:
+                continue
+            row = ranked.iloc[0]
+            used.add(str(row.get("ts_code")))
+            ref = stock_reference(row, f"同属{industry}，按{label}规则排序", label)
+            if ref:
+                roles.append(ref)
+        return roles
+
+    def matching_etfs(industry):
+        if not industry or industry in {"未映射", "宏观政策"}:
+            return []
+        matched = []
+        for etf in etfs:
+            text = f"{etf.get('name') or ''}|{etf.get('benchmark') or ''}"
+            exposures = [str(x.get("industry") or "") for x in (etf.get("industry_exposure") or [])]
+            if industry not in text and not any(industry == x or industry in x or x in industry for x in exposures if x):
+                continue
+            role_priority = 3 if etf.get("tool_role") == "行业/风格工具" else 2 if etf.get("tool_role") == "宽基工具" else 1 if etf.get("tool_role") == "海外联动" else 0
+            score = (role_priority, 2 if industry in text else 1, finite_number(etf.get("amount_yi")) or 0)
+            matched.append((score, etf))
+        return [x[1] for x in sorted(matched, key=lambda x: x[0], reverse=True)]
+
+    def infer_operating_path(item, direction):
+        text = f"{item.get('title') or ''} {item.get('content') or ''}"
+        category = item.get("macro_category")
+        if category == "liquidity":
+            return "流动性→折现率与风险偏好", "操作量需扣除到期量；未取得净投放前不判断宽松强度", "盈利不直接改变，先影响估值折现率和配置偏好"
+        if category in {"inflation", "overseas_inflation"}:
+            return "价格→收入/成本→利润率", "需比较公布值、前值和一致预期，并区分上游与下游", "只有价格传导到收入或成本后才改变盈利预期"
+        if category in {"monetary_policy", "overseas_rate"}:
+            return "利率→融资成本/折现率→估值", "利率方向与预期差决定传导方向", "盈利和估值可能反向变化，需分别验证"
+        if any(word in text for word in ("终止", "取消", "解除")) and any(word in text for word in ("合同", "中标", "订单")):
+            return "订单减少→收入预期承压", "公告确认合同/订单终止，但未从标题取得收入占比", "利润影响取决于合同金额、毛利率和原计划确认节奏"
+        if any(word in text for word in ("中标", "签署合同", "签订合同", "订单")):
+            return "订单增加→收入确认", "公告主体获得合同/订单；金额占比和确认周期仍需核对原文", "只有订单转为收入并形成毛利后才能确认利润增量"
+        if any(word in text for word in ("业绩预增", "扭亏", "净利润增长")):
+            return "利润预期上修", "公告直接涉及盈利变化，仍需剔除非经常性损益", "利润影响较直接，但持续性需下一报告期验证"
+        if any(word in text for word in ("业绩预减", "预亏", "净利润下降", "亏损")):
+            return "利润预期下修", "公告直接涉及盈利下降，仍需拆分经营与一次性因素", "利润影响较直接，现金流是否同步仍需验证"
+        if any(word in text for word in ("涨价", "提价")):
+            return "产品价格上升→收入/毛利率", "需验证销量、客户接受度与原材料成本是否抵消", "量价和成本三者共同决定利润弹性"
+        if any(word in text for word in ("降价", "价格下调")):
+            return "产品价格下降→收入/竞争格局", "需验证销量补偿和成本下降幅度", "利润率可能承压，但不能仅凭降价确认利润下降"
+        if any(word in text for word in ("回购", "增持")):
+            return "流通供给/信号→估值与情绪", "不直接增加主营收入和利润", "盈利不变，主要验证估值和资金承接"
+        if any(word in text for word in ("减持", "解禁")):
+            return "流通供给增加→估值与情绪", "不直接改变主营盈利，但可能增加交易供给", "盈利不变，主要验证折价压力和资金承接"
+        return "经营传导机制尚未识别", "当前结构化消息未提供可验证的供需、成本、收入或订单路径", "不据此上调或下调盈利预期"
+
+    def event_price_window(item):
+        code = str(item.get("ts_code") or "")
+        rows = price_history_by_code.get(code, [])
+        event_date = "".join(ch for ch in str(item.get("time") or "") if ch.isdigit())[:8]
+        if not rows or not event_date:
+            return {"pre_5d_ret": None, "post_ret": None, "event_ret": None, "evidence": "缺少公告主体消息前后价格窗口"}
+        before = [x for x in rows if str(x.get("trade_date") or "") < event_date]
+        after = [x for x in rows if str(x.get("trade_date") or "") >= event_date]
+        pre_ret = None
+        if len(before) >= 6:
+            start, end = finite_number(before[-6].get("close")), finite_number(before[-1].get("close"))
+            pre_ret = (end / start - 1) * 100 if start and end else None
+        baseline = finite_number(before[-1].get("close")) if before else None
+        latest = finite_number(after[-1].get("close")) if after else None
+        post_ret = (latest / baseline - 1) * 100 if baseline and latest else None
+        event_ret = finite_number(after[0].get("pct_chg")) if after else None
+        return {"pre_5d_ret": pre_ret, "post_ret": post_ret, "event_ret": event_ret, "evidence": f"公告前可用{len(before)}日、公告后可用{len(after)}日真实行情"}
+
     news_briefs = []
     for item in news_top:
         direction_score = float(item.get("direction_score") or 0)
@@ -739,33 +851,126 @@ def build():
         if item.get("is_macro") is True:
             acceptance = item.get("market_acceptance") or acceptance
         affected_stock = item.get("name") or None
-        if not affected_stock and industry in stocks_frame.get("industry", pd.Series(dtype=str)).values:
-            candidates = stocks_frame[stocks_frame["industry"] == industry].sort_values("leader_score", ascending=False)
-            affected_stock = candidates.iloc[0].get("name") if not candidates.empty else None
-        etf_candidates = [x for x in etfs if industry and (industry in str(x.get("name") or "") or industry in str(x.get("benchmark") or ""))]
-        if not etf_candidates and sector:
-            etf_candidates = sorted(etfs, key=lambda x: float(x.get("amount_yi") or 0), reverse=True)[:1]
+        etf_candidates = matching_etfs(industry)
         affected_etf = (etf_candidates[0].get("name") or etf_candidates[0].get("ts_code")) if etf_candidates else None
-        sector_objects = []
-        if sector and not stocks_frame.empty:
-            object_frame = stocks_frame[stocks_frame["industry"] == industry].sort_values("leader_score", ascending=False).head(3)
-            sector_objects = [f"{row.get('name')} {row.get('ts_code')}" for _, row in object_frame.iterrows()]
-        object_text = "、".join(sector_objects) if sector_objects else "暂无成分股映射"
-        beneficiary_objects = f"{object_text}；ETF：{affected_etf or '暂无映射'}" if direction != "偏利空" else "防御/替代方向暂未形成可验证成分股映射"
-        harmed_objects = f"{object_text}；ETF：{affected_etf or '暂无映射'}" if direction != "偏利好" else f"{object_text}；ETF：{affected_etf or '暂无映射'}（警惕提前交易或兑现）"
+        direct_rows = stocks_frame[(stocks_frame["ts_code"].astype(str) == str(item.get("ts_code") or "")) | (stocks_frame["name"].astype(str) == str(item.get("name") or ""))] if not stocks_frame.empty else pd.DataFrame()
+        direct_row = direct_rows.iloc[0] if not direct_rows.empty else None
+        direct_ref = stock_reference(direct_row, "公告/消息主体", "直接影响") if direct_row is not None else None
+        role_refs = sector_roles(industry)
+        related_refs = [x for x in role_refs if not direct_ref or x.get("ts_code") != direct_ref.get("ts_code")]
+        true_impact = [direct_ref] if direct_ref else []
+        business_related = related_refs[:3]
+        concept_only = []
+        beneficiary_refs = true_impact if direction == "偏利好" else []
+        harmed_refs = true_impact if direction == "偏利空" else []
+        beneficiary_objects = "、".join(f"{x.get('name')} {x.get('ts_code')}（直接影响）" for x in beneficiary_refs) or "未识别可验证的直接受益标的"
+        harmed_objects = "、".join(f"{x.get('name')} {x.get('ts_code')}（直接影响）" for x in harmed_refs) or "未识别可验证的直接受损标的"
         scope = "个股+板块+ETF" if direct and affected_etf else "板块+ETF观察" if affected_etf else "个股+所属板块" if direct else "板块观察"
         impact_strength = "高" if float(item.get("value_score") or 0) >= 75 else "中" if float(item.get("value_score") or 0) >= 50 else "低"
-        impact = {"impact_type": item.get("impact_type") if item.get("is_macro") is True else "直接影响" if direct else "间接映射", "impact_scope": item.get("impact_scope") if item.get("is_macro") is True else scope, "impact_strength": impact_strength, "duration": "持续性待验证（当前快照不推断时间长度）", "pre_traded": "无法仅凭当前快照确认是否提前交易", "consumption": "当前快照无法确认，需结合消息前后价格、成交额和资金" if sector else "暂无可验证价格窗口", "market_acceptance": acceptance, "sector_ret": sector_ret, "sector_flow": sector_flow, "validation": item.get("validation") if item.get("is_macro") is True else f"验证：{industry}次日资金、龙头/中军与 ETF 是否同步。" if sector else "验证：先补充可映射的板块或标的。", "affected_stock": affected_stock, "affected_etf": affected_etf}
-        impact["impact_chain"] = [{"stage": "消息", "value": item.get("title"), "evidence": f"{item.get('time') or '时间未知'} · 来源 {item.get('source') or '未知'}"}, {"stage": "板块", "value": industry, "evidence": f"影响类型：{impact['impact_type']} · 强度：{impact_strength}"}, {"stage": "资金", "value": industry if sector else "暂无映射", "evidence": f"5日主力净流 {sector_flow:.2f}亿" if sector_flow is not None else "暂无真实资金证据"}, {"stage": "价格", "value": f"{sector_ret:.2f}%" if sector_ret is not None else "暂无价格证据", "evidence": "当前窗口表现，不等于消息因果"}, {"stage": "标的", "value": affected_stock or affected_etf or "暂无映射", "evidence": "个股/ETF仅作观察对象，不代表交易建议"}, {"stage": "验证", "value": "待下一交易日确认", "evidence": impact["validation"]}]
+        operating_path, operating_evidence, profit_path = infer_operating_path(item, direction)
+        price_window = event_price_window(item)
+        pre_ret = price_window.get("pre_5d_ret")
+        post_ret = price_window.get("post_ret")
+        if pre_ret is None:
+            pre_traded = "缺少消息前5日完整价格窗口，无法判断"
+        elif (direction == "偏利好" and pre_ret >= 5) or (direction == "偏利空" and pre_ret <= -5):
+            pre_traded = f"消息前5日已同向变动 {pre_ret:.2f}%，存在提前交易可能"
+        else:
+            pre_traded = f"消息前5日变动 {pre_ret:.2f}%，未达到5%的提前交易观察阈值"
+        digestion_score = None
+        digestion_factors = []
+        if pre_ret is not None and direction != "中性":
+            digestion_score = 50 if abs(pre_ret) >= 5 else 20
+            digestion_factors.append(f"消息前5日同向幅度 {abs(pre_ret):.2f}%")
+        if post_ret is not None and direction != "中性":
+            recognized_after = (direction == "偏利好" and post_ret > 0) or (direction == "偏利空" and post_ret < 0)
+            digestion_score = max(0, min(100, (digestion_score or 20) - 10 if recognized_after else (digestion_score or 20) + 25))
+            digestion_factors.append(f"消息后至今 {post_ret:.2f}%")
+        consumption = f"规则估算 {digestion_score}/100（{'；'.join(digestion_factors)}）" if digestion_score is not None else "缺少消息前后价格窗口，不计算消化程度"
+        leader_ref = next((x for x in role_refs if x.get("tier") == "龙头"), None)
+        core_ref = next((x for x in role_refs if x.get("tier") == "中军"), None)
+        checks = []
+        if direct_ref:
+            direct_ret = direct_ref.get("week_ret")
+            direct_flow = direct_ref.get("net_mf_5d_yi")
+            checks.extend([
+                {"label": "公告主体价格", "value": f"{direct_ref.get('name')} {direct_ret:.2f}%" if direct_ret is not None else f"{direct_ref.get('name')} 未提供", "match": None if direct_ret is None or direction == "中性" else (direct_ret > 0 if direction == "偏利好" else direct_ret < 0), "source": "公告主体窗口涨跌"},
+                {"label": "公告主体资金", "value": f"{direct_flow:.2f}亿" if direct_flow is not None else "未提供", "match": None if direct_flow is None or direction == "中性" else (direct_flow > 0 if direction == "偏利好" else direct_flow < 0), "source": "公告主体5日主力净流"},
+            ])
+        sector_breadth = finite_number(sector.get("breadth")) if sector else None
+        sector_turnover = finite_number(sector.get("turnover_yi")) if sector else None
+        checks.extend([
+            {"label": "板块价格", "value": f"{sector_ret:.2f}%" if sector_ret is not None else "未提供", "match": None if sector_ret is None or direction == "中性" else (sector_ret > 0 if direction == "偏利好" else sector_ret < 0), "source": "板块窗口涨跌"},
+            {"label": "板块资金", "value": f"{sector_flow:.2f}亿" if sector_flow is not None else "未提供", "match": None if sector_flow is None or direction == "中性" else (sector_flow > 0 if direction == "偏利好" else sector_flow < 0), "source": "板块5日主力净流"},
+            {"label": "板块上涨宽度", "value": f"{sector_breadth:.1f}%" if sector_breadth is not None else "未提供", "match": None if sector_breadth is None or direction == "中性" else (sector_breadth >= 50 if direction == "偏利好" else sector_breadth < 50), "source": "上涨成分股数/有效成分股数"},
+            {"label": "板块成交额", "value": f"{sector_turnover:.2f}亿" if sector_turnover is not None else "未提供", "match": None, "source": "当前窗口成交额；缺少消息前基准，不判断放量/缩量"},
+            {"label": "龙头", "value": f"{leader_ref.get('name')} {leader_ref.get('week_ret'):.2f}%" if leader_ref and leader_ref.get("week_ret") is not None else "未提供", "match": None if not leader_ref or leader_ref.get("week_ret") is None or direction == "中性" else (leader_ref.get("week_ret") > 0 if direction == "偏利好" else leader_ref.get("week_ret") < 0), "source": "板块龙头规则与窗口涨跌"},
+            {"label": "中军", "value": f"{core_ref.get('name')} {core_ref.get('week_ret'):.2f}%" if core_ref and core_ref.get("week_ret") is not None else "未提供", "match": None if not core_ref or core_ref.get("week_ret") is None or direction == "中性" else (core_ref.get("week_ret") > 0 if direction == "偏利好" else core_ref.get("week_ret") < 0), "source": "板块中军规则与窗口涨跌"},
+        ])
+        primary_etf = etf_candidates[0] if etf_candidates else None
+        if primary_etf:
+            etf_ret = finite_number(primary_etf.get("week_ret"))
+            checks.append({"label": "匹配ETF", "value": f"{primary_etf.get('name') or primary_etf.get('ts_code')} {etf_ret:.2f}%" if etf_ret is not None else f"{primary_etf.get('name') or primary_etf.get('ts_code')} 收益未提供", "match": None if etf_ret is None or direction == "中性" else (etf_ret > 0 if direction == "偏利好" else etf_ret < 0), "source": "明确行业/基准匹配ETF"})
+            etf_share_change = finite_number(primary_etf.get("share_change_pct"))
+            checks.append({"label": "ETF份额变化", "value": f"{etf_share_change:.2f}%" if etf_share_change is not None else "未提供", "match": None if etf_share_change is None or direction == "中性" else (etf_share_change > 0 if direction == "偏利好" else etf_share_change < 0), "source": "基金份额快照变化；不等于纯申赎金额"})
+        available_checks = [x for x in checks if x.get("match") is not None]
+        matched_checks = sum(1 for x in available_checks if x.get("match") is True)
+        recognition_score = round(matched_checks / len(available_checks) * 100) if available_checks else None
+        if recognition_score is not None:
+            acceptance = f"{matched_checks}/{len(available_checks)}项价格资金证据同向（{recognition_score}/100）；仅表示市场表现一致，不证明因果"
+        valuation_evidence = "未映射公告主体估值数据"
+        if direct_ref:
+            valuation_evidence = f"公告主体 PE {direct_ref.get('pe') if direct_ref.get('pe') is not None else '未提供'}、PB {direct_ref.get('pb') if direct_ref.get('pb') is not None else '未提供'}；消息不直接生成目标价"
+        institution_state = f"板块5日主力净流 {sector_flow:.2f}亿" if sector_flow is not None else "板块资金未提供"
+        if core_ref and core_ref.get("net_mf_5d_yi") is not None:
+            institution_state += f"；中军代理资金 {core_ref.get('net_mf_5d_yi'):.2f}亿"
+        etf_state = "未找到名称、基准或行业暴露明确匹配的ETF"
+        if primary_etf:
+            share_text = f"{primary_etf.get('share_change_pct'):.2f}%" if finite_number(primary_etf.get("share_change_pct")) is not None else "未提供"
+            premium_text = f"{primary_etf.get('premium_discount'):.2f}%" if finite_number(primary_etf.get("premium_discount")) is not None else "未提供"
+            etf_state = f"{primary_etf.get('name') or primary_etf.get('ts_code')}：份额变化 {share_text}，溢折价 {premium_text}"
+        impact = {"impact_type": item.get("impact_type") if item.get("is_macro") is True else "直接影响" if direct else "间接映射", "impact_scope": item.get("impact_scope") if item.get("is_macro") is True else scope, "impact_strength": impact_strength, "duration": "持续性待验证（当前快照不推断时间长度）", "pre_traded": pre_traded, "consumption": consumption, "digestion_score": digestion_score, "market_acceptance": acceptance, "recognition_score": recognition_score, "sector_ret": sector_ret, "sector_flow": sector_flow, "validation": item.get("validation") if item.get("is_macro") is True else f"验证：{industry}次日资金、龙头/中军与明确匹配 ETF 是否同步。" if sector else "验证：先补充可映射的板块或标的。", "affected_stock": affected_stock, "affected_etf": affected_etf, "operating_path": operating_path, "operating_evidence": operating_evidence, "profit_path": profit_path, "valuation_evidence": valuation_evidence, "institution_proxy": institution_state, "etf_fund_evidence": etf_state, "asset_tiers": {"direct": true_impact, "business_related": business_related, "concept_only": concept_only}, "role_targets": role_refs, "verification_checks": checks, "price_window": price_window}
+        direct_label = direct_ref.get("name") if direct_ref else "无可验证直接标的"
+        related_label = "、".join(x.get("name") for x in business_related) or "无可验证名单"
+        impact["impact_chain_v2"] = [
+            {"stage": "1 消息判断", "headline": f"{direction} · {impact_strength}强度", "evidence": [f"{item.get('time') or '时间未知'} · {item.get('source') or '来源未知'}", f"直接/间接：{impact['impact_type']} · 范围：{impact['impact_scope']}", pre_traded]},
+            {"stage": "2 经营与盈利", "headline": operating_path, "evidence": [operating_evidence, profit_path]},
+            {"stage": "3 估值与配置", "headline": "估值、机构代理与ETF资金", "evidence": [valuation_evidence, institution_state, etf_state]},
+            {"stage": "4 标的分层", "headline": f"直接：{direct_label}", "evidence": [f"业务相关但业绩未验证：{related_label}", "纯概念映射：未形成可验证名单时不展示", f"受益：{beneficiary_objects}", f"受损：{harmed_objects}"]},
+            {"stage": "5 市场验证", "headline": acceptance, "evidence": [f"{x['label']}：{x['value']}（{'同向' if x.get('match') is True else '背离' if x.get('match') is False else '待验证'}）" for x in checks] + [consumption, impact["validation"]]},
+        ]
+        impact["impact_chain"] = [{"stage": x["stage"], "value": x["headline"], "evidence": "；".join(x["evidence"][:2])} for x in impact["impact_chain_v2"]]
         item.update(impact)
         news_briefs.append({"title": item.get("title"), "url": item.get("url"), "source": item.get("source"), "time": item.get("time"), "industry": industry, "name": affected_stock, "direction": direction, "value_score": item.get("value_score"), "trust_score": item.get("trust_score"), "score_breakdown": item.get("score_breakdown"), "score_formula": item.get("score_formula"), "reason": item.get("reasons"), "beneficiary_objects": beneficiary_objects, "harmed_objects": harmed_objects, **impact})
-    macro_profiles = {"inflation": ("周期/资源、金融", "高估值成长、消费"), "overseas_inflation": ("价值、防御", "海外敏感成长"), "liquidity": ("宽基、金融、地产链", "高杠杆与高估值方向"), "monetary_policy": ("利率敏感资产", "利率上行敏感方向"), "overseas_rate": ("美元/利率受益方向", "高估值成长、外资敏感方向")}
     for brief, raw in zip(news_briefs, news_top):
         if raw.get("is_macro") is True:
             category = raw.get("macro_category")
             benefit, risk = macro_profiles.get(category, ("需结合数据方向确认", "需结合数据方向确认"))
-            brief.update({"is_macro": True, "macro_category": category, "industry": "宏观政策", "impact_type": raw.get("impact_type") or "间接影响（宏观情景映射）", "impact_scope": raw.get("impact_scope") or "指数+风格+板块+ETF（情景映射）", "affected_stock": None, "affected_etf": None, "macro_benefit_scenarios": raw.get("macro_benefit_scenarios") or benefit, "macro_risk_scenarios": raw.get("macro_risk_scenarios") or risk, "validation": raw.get("validation") or "比较前值与一致预期，再观察指数宽度、利率、相关板块和 ETF 是否同步"})
-            brief["impact_chain"] = [{"stage": "宏观数据", "value": raw.get("title"), "evidence": f"发布/数据日期：{raw.get('time') or '未知'} · 来源：{raw.get('source') or '未知'}"}, {"stage": "受益情景", "value": benefit, "evidence": "仅为传导假设，需价格和资金验证"}, {"stage": "受损情景", "value": risk, "evidence": "仅为传导假设，需价格和资金验证"}, {"stage": "验证", "value": "等待下一交易日或预期差确认", "evidence": brief.get("validation") or "暂无"}]
+            broad_etfs = sorted([x for x in etfs if x.get("tool_role") == "宽基工具"], key=lambda x: finite_number(x.get("amount_yi")) or 0, reverse=True)
+            broad_etf = broad_etfs[0] if broad_etfs else None
+            broad_etf_name = (broad_etf.get("name") or broad_etf.get("ts_code")) if broad_etf else None
+            broad_etf_evidence = "未找到可验证宽基ETF"
+            if broad_etf:
+                broad_return_text = f"{broad_etf.get('week_ret'):.2f}%" if finite_number(broad_etf.get("week_ret")) is not None else "未提供"
+                broad_share_text = f"{broad_etf.get('share_change_pct'):.2f}%" if finite_number(broad_etf.get("share_change_pct")) is not None else "未提供"
+                broad_premium_text = f"{broad_etf.get('premium_discount'):.2f}%" if finite_number(broad_etf.get("premium_discount")) is not None else "未提供"
+                broad_etf_evidence = f"{broad_etf_name}：窗口涨跌 {broad_return_text}，份额变化 {broad_share_text}，溢折价 {broad_premium_text}"
+            macro_checks = [
+                {"label": "市场等权价格", "value": f"{mean_ret:.2f}%", "match": None, "source": "全市场个股窗口等权涨跌"},
+                {"label": "全市场资金", "value": f"{total_stock_flow:.2f}亿" if total_stock_flow is not None else "未提供", "match": None, "source": "个股5日主力净流汇总"},
+                {"label": "上涨宽度", "value": f"{breadth:.1f}%" if breadth is not None else "未提供", "match": None, "source": "上涨个股数/有效个股数"},
+                {"label": "宽基ETF", "value": broad_etf_evidence, "match": None, "source": "成交活跃宽基ETF观察"},
+            ]
+            validation = raw.get("validation") or "比较前值与一致预期，再观察指数宽度、利率、相关板块和 ETF 是否同步"
+            brief.update({"is_macro": True, "macro_category": category, "industry": "宏观政策", "impact_type": raw.get("impact_type") or "间接影响（宏观情景映射）", "impact_scope": raw.get("impact_scope") or "指数+风格+板块+ETF（情景映射）", "affected_stock": None, "affected_etf": broad_etf_name, "macro_benefit_scenarios": raw.get("macro_benefit_scenarios") or benefit, "macro_risk_scenarios": raw.get("macro_risk_scenarios") or risk, "beneficiary_objects": f"受益情景：{benefit}；没有预期差证据前不生成确定受益名单", "harmed_objects": f"风险情景：{risk}；没有预期差证据前不生成确定受损名单", "etf_fund_evidence": broad_etf_evidence, "verification_checks": macro_checks, "validation": validation})
+            brief["impact_chain_v2"] = [
+                {"stage": "1 消息判断", "headline": f"宏观情景 · {brief.get('impact_strength') or '强度待定'}", "evidence": [f"{raw.get('time') or '时间未知'} · {raw.get('source') or '来源未知'}", f"范围：{brief.get('impact_scope')}", "必须结合前值、一致预期和净投放/实际值判断方向"]},
+                {"stage": "2 经营与盈利", "headline": brief.get("operating_path") or "宏观变量传导", "evidence": [brief.get("operating_evidence") or "传导机制待验证", brief.get("profit_path") or "盈利影响待验证"]},
+                {"stage": "3 估值与配置", "headline": "折现率、风险偏好与宽基ETF", "evidence": [f"受益情景：{benefit}", f"风险情景：{risk}", broad_etf_evidence]},
+                {"stage": "4 标的分层", "headline": "不生成确定个股受益名单", "evidence": ["宏观数据先映射指数、风格和ETF", "板块与个股必须等待实际价格、资金和盈利预期验证", f"宽基观察：{broad_etf_name or '未映射'}"]},
+                {"stage": "5 市场验证", "headline": brief.get("market_acceptance") or "等待市场验证", "evidence": [f"{x['label']}：{x['value']}" for x in macro_checks] + [validation]},
+            ]
+            brief["impact_chain"] = [{"stage": x["stage"], "value": x["headline"], "evidence": "；".join(x["evidence"][:2])} for x in brief["impact_chain_v2"]]
     for brief in news_briefs:
         if brief.get("is_macro") is True:
             continue
@@ -816,8 +1021,29 @@ def build():
         "韩国综合": ["半导体", "电子设备", "元件"],
         "日经225": ["汽车", "家用电器", "电子设备"],
         "纳斯达克": ["软件服务", "互联网", "半导体", "电子设备"],
+        "恒生科技": ["软件服务", "互联网", "半导体", "电子设备"],
+        "纳斯达克中国金龙": ["互联网", "软件服务", "传媒娱乐"],
+        "美元指数": ["半导体", "软件服务", "互联网"],
+        "离岸人民币": ["半导体", "软件服务", "互联网"],
+        "美国国债10年": ["半导体", "软件服务", "互联网"],
+        "COMEX黄金": ["黄金"],
+        "WTI原油": ["石油", "化工"],
+        "COMEX铜": ["铜", "有色"],
+        "英伟达": ["半导体", "电子设备", "元件", "通信设备"],
+        "博通": ["半导体", "电子设备", "元件", "通信设备"],
+        "美光科技": ["半导体", "电子设备", "元件"],
+        "特斯拉": ["汽车", "汽车配件", "电气设备"],
         "标普500": [],
         "道琼斯": [],
+        "富时中国A50": [],
+    }
+    transmission_profiles = {
+        "费城半导体": ("产业链传导", 1), "中国台湾加权": ("产业链传导", 1), "韩国综合": ("产业链传导", 1),
+        "英伟达": ("产业链传导", 1), "博通": ("产业链传导", 1), "美光科技": ("产业链传导", 1), "特斯拉": ("产业链传导", 1),
+        "COMEX黄金": ("商品价格传导", 1), "WTI原油": ("商品价格传导", 1), "COMEX铜": ("商品价格传导", 1),
+        "美元指数": ("汇率与流动性传导", -1), "离岸人民币": ("汇率传导", -1), "美国国债10年": ("折现率与流动性传导", -1),
+        "纳斯达克": ("风险偏好传导", 1), "恒生科技": ("中国资产风险偏好", 1), "纳斯达克中国金龙": ("中国资产风险偏好", 1),
+        "富时中国A50": ("A股盘前价格映射", 1), "标普500": ("全球风险偏好", 1), "道琼斯": ("全球风险偏好", 1), "日经225": ("区域产业与风险偏好", 1),
     }
     corr_by_asset = {}
     for item in overseas:
@@ -845,17 +1071,48 @@ def build():
         except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
             pass
         ret5 = item.get("ret_5d")
-        if target_ret is None:
+        channel, relation_sign = transmission_profiles.get(asset, ("相关资产映射", 1))
+        broad_target = asset in {"标普500", "道琼斯", "富时中国A50"}
+        if target_ret is None and broad_target:
+            target_ret = mean_ret
+        expected_effect = finite_number(ret5) * relation_sign if finite_number(ret5) is not None else None
+        if target_ret is None or expected_effect is None:
             state = "仅有海外价格，暂无对应A股板块验证"
-        elif ret5 is not None and ret5 < 0 and target_ret < 0:
-            state = "海外变量正常传导"
-        elif ret5 is not None and ret5 < 0 and target_ret >= 0:
-            state = "A股暂时吸收或走独立行情"
-        elif ret5 is not None and ret5 > 0 and target_ret <= 0:
+        elif expected_effect < 0 and target_ret < 0:
+            state = "海外利空正常传导"
+        elif expected_effect < 0 and target_ret >= 0:
+            state = "海外利空被A股吸收"
+        elif expected_effect > 0 and target_ret <= 0:
             state = "海外利好暂未获A股认可"
+        elif abs(finite_number(lead_corr) or 0) < 0.2 and abs(finite_number(same_corr) or 0) < 0.2:
+            state = "方向一致但相关性低，暂按A股独立行情观察"
         else:
-            state = "海外与A股方向暂时一致"
-        overseas_conduction.append({"asset": asset, "group": item.get("group"), "ret_5d": ret5, "ret_20d": item.get("ret_20d"), "ret_60d": item.get("ret_60d"), "targets": [s.get("industry") for s in targets[:5]], "target_ret": target_ret, "same_corr_60": same_corr, "lead_corr_60": lead_corr, "state": state, "confidence": "中" if targets and same_corr is not None else "低"})
+            state = "海外利好与A股方向一致"
+        target_names = [s.get("industry") for s in targets[:5]]
+        role_targets = []
+        for target_name in target_names[:2]:
+            role_targets.extend(sector_roles(target_name)[:2])
+        deduped_roles = []
+        seen_role_codes = set()
+        for role in role_targets:
+            if role.get("ts_code") in seen_role_codes:
+                continue
+            seen_role_codes.add(role.get("ts_code"))
+            deduped_roles.append(role)
+        matched_etf = None
+        for target_name in target_names:
+            candidates = matching_etfs(target_name)
+            if candidates:
+                matched_etf = candidates[0]
+                break
+        if not matched_etf:
+            asset_terms = {"纳斯达克": ["纳指", "纳斯达克"], "恒生科技": ["恒生科技"], "纳斯达克中国金龙": ["中概", "中国互联网"], "富时中国A50": ["A50"], "COMEX黄金": ["黄金"], "WTI原油": ["油气", "石油"], "COMEX铜": ["有色", "铜"]}.get(asset, [])
+            matched_etf = next((x for x in etfs if any(term in f"{x.get('name') or ''}|{x.get('benchmark') or ''}" for term in asset_terms)), None)
+        correlation_values = [abs(x) for x in [same_corr, lead_corr] if x is not None and math.isfinite(x)]
+        confidence = "中" if (target_names or broad_target) and correlation_values else "低"
+        if correlation_values and max(correlation_values) >= 0.5 and (target_names or broad_target):
+            confidence = "中高"
+        overseas_conduction.append({"asset": asset, "group": item.get("group"), "trade_date": item.get("trade_date"), "ret_5d": ret5, "ret_20d": item.get("ret_20d"), "ret_60d": item.get("ret_60d"), "channel": channel, "relation_sign": relation_sign, "expected_effect": expected_effect, "targets": target_names, "target_scope": "A股全市场等权" if broad_target and not target_names else "、".join(target_names) if target_names else "暂无可验证A股映射", "target_ret": target_ret, "same_corr_60": same_corr, "lead_corr_60": lead_corr, "state": state, "confidence": confidence, "role_targets": deduped_roles[:4], "matched_etf": {"name": matched_etf.get("name"), "ts_code": matched_etf.get("ts_code"), "week_ret": matched_etf.get("week_ret"), "share_change_pct": matched_etf.get("share_change_pct"), "premium_discount": matched_etf.get("premium_discount")} if matched_etf else None, "evidence_boundary": "海外与A股按交易日价格、映射板块和滚动相关比较；方向一致不等于因果。", "validation": "下一A股交易日复核映射板块、龙头/中军、匹配ETF和人民币/利率是否继续同向。"})
     for row in overseas_conduction:
         row.update(corr_by_asset.get(row.get("asset"), {}))
     high_low_switch = {
@@ -1362,11 +1619,33 @@ def build():
 '''
     news_switch_ui = r'''const impactRowsForSwitch=(summary.news_briefs||news).slice().sort((a,b)=>Number(b.value_score||0)-Number(a.value_score||0)).slice(0,12);document.querySelectorAll('#newsImpactMap .impact-item').forEach((el,i)=>{const x=impactRowsForSwitch[i];if(x?.is_macro)el.insertAdjacentHTML('afterbegin',`<small class="macro-badge">宏观类别：${escHtml(x.macro_category||'宏观数据')} · 受益情景：${escHtml(x.macro_benefit_scenarios||'需验证')} · 风险情景：${escHtml(x.macro_risk_scenarios||'需验证')}</small>`)});document.querySelectorAll('#topNewsList .news-brief').forEach((el,i)=>{el.addEventListener('click',e=>{if(e.target.closest('a'))return;showView('newsView');const b=document.querySelector(`#impactNewsSwitcher button[data-impact-index="${i}"]`);b?.click()})});const macroBadgeStyle=document.createElement('style');macroBadgeStyle.textContent='.macro-badge{color:var(--gold)!important;border-left:2px solid var(--gold);padding-left:6px}';document.head.appendChild(macroBadgeStyle)
 '''
-    overseas_corr_ui = r'''document.querySelectorAll('#overseasList .overseas-item').forEach((el,i)=>{const x=(summary.overseas_conduction||[])[i];if(!x)return;el.insertAdjacentHTML('beforeend',`<small>滚动同步相关：5日 ${fmt(x.same_corr_5,2)} · 20日 ${fmt(x.same_corr_20,2)} · 60日 ${fmt(x.same_corr_60,2)}</small><small>领先1日相关：5日 ${fmt(x.lead_corr_5,2)} · 20日 ${fmt(x.lead_corr_20,2)} · 60日 ${fmt(x.lead_corr_60,2)}</small>`)});
+    overseas_corr_ui = r'''document.querySelectorAll('#overseasList .overseas-item').forEach((el,i)=>{const x=(summary.overseas_conduction||[])[i];if(!x)return;const relation=x.relation_sign===-1?'海外变量上升通常对应A股映射方向承压':'海外变量与A股映射方向按同向观察',etf=x.matched_etf,roles=x.role_targets||[];el.insertAdjacentHTML('beforeend',`<small class="overseas-channel-summary">${escHtml(x.channel||'相关资产映射')} · ${escHtml(x.target_scope||'暂无A股验证对象')}</small><button class="overseas-toggle" type="button">展开传导证据</button><div class="overseas-evidence" hidden><small><b>传导通道</b>${escHtml(x.channel||'相关资产映射')} · ${escHtml(relation)}</small><small><b>A股验证对象</b>${escHtml(x.target_scope||'暂无可验证映射')} · 窗口涨跌 ${fmt(x.target_ret)}%</small><small><b>滚动同步相关</b>5日 ${fmt(x.same_corr_5,2)} · 20日 ${fmt(x.same_corr_20,2)} · 60日 ${fmt(x.same_corr_60,2)}</small><small><b>海外领先1日相关</b>5日 ${fmt(x.lead_corr_5,2)} · 20日 ${fmt(x.lead_corr_20,2)} · 60日 ${fmt(x.lead_corr_60,2)}</small><div class="overseas-targets">${roles.map(v=>`<button data-overseas-stock="${escHtml(v.ts_code||'')}">${escHtml(v.name||v.ts_code)}<span>${escHtml(v.tier||'观察')} · ${fmt(v.week_ret)}%</span></button>`).join('')||'<span>暂无可验证龙头/中军映射</span>'}</div><small><b>匹配ETF</b>${etf?`${escHtml(etf.name||etf.ts_code)} · ${fmt(etf.week_ret)}% · 份额 ${fmt(etf.share_change_pct)}% · 溢折价 ${fmt(etf.premium_discount)}%`:'未找到名称、基准或行业暴露明确匹配的ETF'}</small><small><b>下一步验证</b>${escHtml(x.validation||'等待下一A股交易日验证')}</small><small class="source">${escHtml(x.evidence_boundary||'方向一致不等于因果')}</small></div>`);const toggle=el.querySelector('.overseas-toggle'),evidence=el.querySelector('.overseas-evidence');toggle.onclick=()=>{evidence.hidden=!evidence.hidden;toggle.textContent=evidence.hidden?'展开传导证据':'收起传导证据'};el.querySelectorAll('[data-overseas-stock]').forEach(b=>b.onclick=()=>b.dataset.overseasStock&&selectStock(b.dataset.overseasStock,true))});const overseasEvidenceStyle=document.createElement('style');overseasEvidenceStyle.textContent='.overseas-channel-summary{color:var(--cyan)!important}.overseas-toggle{margin-top:6px;border:1px solid var(--line);background:#0b1218;color:var(--gold);padding:5px 7px;cursor:pointer;font:inherit;font-size:10px}.overseas-evidence{margin-top:7px;padding-top:6px;border-top:1px solid var(--line)}.overseas-evidence[hidden]{display:none}.overseas-evidence small b{display:inline;color:var(--gold);margin-right:5px}.overseas-targets{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px;margin:5px 0}.overseas-targets button{border:1px solid var(--line);background:#0b1218;color:var(--text);padding:5px;text-align:left;cursor:pointer}.overseas-targets button span{display:block;color:var(--muted);font-size:9px}.overseas-targets>span{color:var(--muted);font-size:10px}@media(max-width:600px){.overseas-targets{grid-template-columns:1fr}}';document.head.appendChild(overseasEvidenceStyle);
 '''
     news_detail_ui = r'''const topNewsRows=(summary.news_briefs||[]);document.querySelectorAll('#topNewsList .news-brief').forEach((el,i)=>{const x=topNewsRows[i];if(!x)return;el.insertAdjacentHTML('beforeend',`<small>影响范围：${escHtml(x.impact_scope||'暂无')} · 市场认可：${escHtml(x.market_acceptance||'待验证')}</small><small>受益情景：${escHtml(x.is_macro?x.macro_benefit_scenarios:x.benefit_scenarios||'待验证')}</small><small>风险情景：${escHtml(x.is_macro?x.macro_risk_scenarios:x.risk_scenarios||'待验证')}</small><small>观察对象：${escHtml(x.affected_stock||'暂无个股')} · ${escHtml(x.affected_etf||'暂无ETF')}</small>`)});
 '''
     news_objects_ui = r'''const newsObjectRows=summary.news_briefs||[];document.querySelectorAll('#topNewsList .news-brief').forEach((el,i)=>{const x=newsObjectRows[i];if(!x||x.is_macro)return;el.insertAdjacentHTML('beforeend',`<small>受益对象：${escHtml(x.beneficiary_objects||'暂无可验证映射')}</small><small>受损对象：${escHtml(x.harmed_objects||'暂无可验证映射')} · 仅为情景对象</small>`)});
+'''
+    news_chain_v2_ui = r'''
+const impactChainRowsV2=(summary.news_briefs||news).slice().sort((a,b)=>Number(b.value_score||0)-Number(a.value_score||0)).slice(0,12);
+document.querySelectorAll('#newsImpactMap .impact-item').forEach((item,index)=>{
+  const x=impactChainRowsV2[index],stages=x?.impact_chain_v2||[];if(!x||!stages.length)return;
+  item.querySelector('.impact-chain-detail')?.remove();
+  const box=document.createElement('div');box.className='impact-chain-workbench';
+  const matchText=v=>v===true?'同向':v===false?'背离':'待验证',matchClass=v=>v===true?'up':v===false?'down':'muted';
+  const targets=[...(x.asset_tiers?.direct||[]),...(x.asset_tiers?.business_related||[])];
+  const renderStage=stageIndex=>{
+    const stage=stages[stageIndex]||stages[0],isAsset=stageIndex===3,isValidation=stageIndex===4;
+    box.querySelectorAll('.impact-stage-button').forEach((b,i)=>b.classList.toggle('active',i===stageIndex));
+    let extra='';
+    if(isAsset){extra=`<div class="impact-target-groups"><div><b>直接影响</b>${(x.asset_tiers?.direct||[]).map(v=>`<button data-chain-stock="${escHtml(v.ts_code||'')}">${escHtml(v.name||v.ts_code)}<small>${escHtml(v.relation||'公告主体')}</small></button>`).join('')||'<span>没有可验证直接标的</span>'}</div><div><b>业务相关，业绩未验证</b>${(x.asset_tiers?.business_related||[]).map(v=>`<button data-chain-stock="${escHtml(v.ts_code||'')}">${escHtml(v.name||v.ts_code)}<small>${escHtml(v.tier||'同行')} · 5日 ${fmt(v.week_ret)}%</small></button>`).join('')||'<span>没有可验证名单</span>'}</div><div><b>纯概念映射</b><span>${(x.asset_tiers?.concept_only||[]).length?'存在映射，仍需核实业务收入':'未形成可验证名单，不展示猜测标的'}</span></div></div>`}
+    if(isValidation){extra=`<div class="impact-check-grid">${(x.verification_checks||[]).map(v=>`<div><span>${escHtml(v.label||'验证项')}</span><b class="${matchClass(v.match)}">${escHtml(v.value||'未提供')}</b><em>${matchText(v.match)} · ${escHtml(v.source||'来源未提供')}</em></div>`).join('')||'<span>暂无价格资金验证项</span>'}</div>`}
+    box.querySelector('.impact-stage-evidence').innerHTML=`<div class="impact-stage-title"><b>${escHtml(stage.stage)}</b><span>${escHtml(stage.headline||'暂无结论')}</span></div>${(stage.evidence||[]).map(v=>`<p>${escHtml(v)}</p>`).join('')}${extra}<small class="source">${stageIndex===4?'同向只表示价格/资金表现与消息方向一致，不证明消息是唯一原因。':'缺失环节不补数字；情景映射不等于确定受益或受损。'}</small>`;
+    box.querySelectorAll('[data-chain-stock]').forEach(b=>b.onclick=()=>b.dataset.chainStock&&selectStock(b.dataset.chainStock,true));
+  };
+  box.innerHTML=`<div class="impact-chain-kpis"><span>方向<b class="${x.direction==='偏利好'?'up':x.direction==='偏利空'?'down':'gold'}">${escHtml(x.direction||'中性')}</b></span><span>影响强度<b>${escHtml(x.impact_strength||'未知')}</b></span><span>利好消化<b>${x.digestion_score==null?'不可计算':fmt(x.digestion_score,0)+'/100'}</b></span><span>市场同向证据<b>${x.recognition_score==null?'待验证':fmt(x.recognition_score,0)+'/100'}</b></span></div><div class="impact-stage-tabs">${stages.map((v,i)=>`<button class="impact-stage-button${i===0?' active':''}" data-stage-index="${i}"><span>${escHtml(v.stage)}</span><b>${escHtml(v.headline||'暂无')}</b></button>`).join('')}</div><div class="impact-stage-evidence"></div>`;
+  item.appendChild(box);box.querySelectorAll('[data-stage-index]').forEach(b=>b.onclick=()=>renderStage(Number(b.dataset.stageIndex)));renderStage(0);
+});
+const newsChainV2Style=document.createElement('style');newsChainV2Style.textContent='.impact-chain-workbench{margin-top:9px;border-top:1px solid var(--line);padding-top:8px}.impact-chain-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;margin-bottom:6px}.impact-chain-kpis span{background:var(--panel2);padding:6px;color:var(--muted);font-size:10px}.impact-chain-kpis b{display:block;color:var(--text);font-size:12px;margin-top:2px}.impact-stage-tabs{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:3px}.impact-stage-button{min-height:60px;border:1px solid var(--line);border-top:2px solid transparent;background:var(--panel2);color:var(--text);padding:6px;text-align:left;cursor:pointer;font:inherit;min-width:0}.impact-stage-button span,.impact-stage-button b{display:block;overflow-wrap:anywhere}.impact-stage-button span{color:var(--gold);font-size:10px}.impact-stage-button b{font-size:11px;line-height:1.35;margin-top:3px}.impact-stage-button.active{border-top-color:var(--gold);background:#1a252d}.impact-stage-evidence{background:#0b1218;padding:9px;margin-top:4px;min-height:105px}.impact-stage-title{display:grid;grid-template-columns:110px 1fr;gap:8px;margin-bottom:7px}.impact-stage-title b{color:var(--gold)}.impact-stage-title span{font-weight:700}.impact-stage-evidence p{margin:4px 0;color:var(--muted);font-size:11px;line-height:1.5}.impact-target-groups{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin-top:7px}.impact-target-groups>div{background:var(--panel2);padding:6px}.impact-target-groups>div>b,.impact-target-groups span{display:block}.impact-target-groups>div>b{color:var(--gold);font-size:10px;margin-bottom:4px}.impact-target-groups button{width:100%;border:0;border-top:1px solid var(--line);background:transparent;color:var(--text);padding:5px 0;text-align:left;cursor:pointer}.impact-target-groups button small,.impact-target-groups span{color:var(--muted);font-size:10px}.impact-check-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px;margin-top:7px}.impact-check-grid>div{background:var(--panel2);padding:6px}.impact-check-grid span,.impact-check-grid b,.impact-check-grid em{display:block}.impact-check-grid span,.impact-check-grid em{color:var(--muted);font-size:10px}.impact-check-grid em{font-style:normal;margin-top:3px}@media(max-width:700px){.impact-chain-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.impact-stage-tabs{grid-template-columns:1fr}.impact-stage-button{min-height:0}.impact-stage-title{grid-template-columns:1fr}.impact-target-groups,.impact-check-grid{grid-template-columns:1fr}}';document.head.appendChild(newsChainV2Style);
 '''
     stock_final_ui = r'''const finalStockOverlay=()=>{const x=selectedStock,p=prices.filter(v=>v.ts_code===x.ts_code).sort((a,b)=>String(a.trade_date).localeCompare(String(b.trade_date)));if(!p.length)return;const close=p.map(v=>Number(v.close)).filter(Number.isFinite),current=close.at(-1),window=p.slice(-60),distinct=(values,ascending)=>{const out=[];for(const v of [...values].sort((a,b)=>ascending?a-b:b-a)){if(!out.some(z=>Math.abs(z-v)/Math.max(Math.abs(z),1)<.012))out.push(Number(v.toFixed(2)))}return out};const lows=[],highs=[];for(let i=2;i<p.length-2;i++){const lo=Number(p[i].low),hi=Number(p[i].high);if(Number.isFinite(lo)&&[p[i-2],p[i-1],p[i+1],p[i+2]].every(v=>lo<=Number(v.low)))lows.push(lo);if(Number.isFinite(hi)&&[p[i-2],p[i-1],p[i+1],p[i+2]].every(v=>hi>=Number(v.high)))highs.push(hi)}const recentLow=Math.min(...window.map(v=>Number(v.low)).filter(Number.isFinite)),recentHigh=Math.max(...window.map(v=>Number(v.high)).filter(Number.isFinite)),supports=distinct(lows.filter(v=>v<current),false).slice(0,3),resistances=distinct(highs.filter(v=>v>current),true).slice(0,3);if(!supports.length&&Number.isFinite(recentLow)&&recentLow<current)supports.push(Number(recentLow.toFixed(2)));if(!resistances.length&&Number.isFinite(recentHigh)&&recentHigh>current)resistances.push(Number(recentHigh.toFixed(2)));const s1=supports[0],r1=resistances[0],risk=Number.isFinite(s1)?Math.max(0,current-s1):null,reward=Number.isFinite(r1)?Math.max(0,r1-current):null,rr=risk&&reward?reward/risk:null;stockChart.setOption({series:[{markLine:{silent:true,symbol:['none','none'],data:[...supports.map((v,i)=>({yAxis:v,name:`支撑${i+1}`})),...resistances.map((v,i)=>({yAxis:v,name:`压力${i+1}`}))],label:{color:C.gold}}}]});const box=document.querySelector('#tradeLevels');if(box)box.innerHTML=`<div class="trade-level-grid"><div><span>当前价</span><b>${fmt(current)}</b></div><div><span>支撑位1 / 2 / 3</span><b>${supports.map(fmt).join(' / ')||'—'}</b></div><div><span>压力位1 / 2 / 3</span><b>${resistances.map(fmt).join(' / ')||'—'}</b></div><div><span>最近压力空间</span><b>${reward!=null?fmt(reward/current*100)+'%':'—'}</b></div><div><span>最近支撑风险</span><b>${risk!=null?fmt(risk/current*100)+'%':'—'}</b></div><div><span>观察盈亏比</span><b>${rr!=null?fmt(rr,2):'—'}</b></div></div><small class="source">支撑/压力取近60个交易日的真实局部高低点，并按1.2%邻近价位去重；不足时回退到近60日区间边界。它们是观察区间，不是保证反转的价格。</small>`;const decision=document.querySelector('#stockDecision');if(decision){const aligned=selectedStock.industry===summary.trade_sector||selectedStock.industry===summary.strongest_sector,sync=Number(selectedStock.week_ret)>0&&Number(selectedStock.net_mf_5d_yi)>0?'价格与5日资金同步':Number(selectedStock.week_ret)>0?'上涨但资金未确认':Number(selectedStock.net_mf_5d_yi)>0?'下跌但资金承接':'价格与资金未同步';decision.innerHTML=`<b>交易判断摘要：${aligned?'属于当前主线观察范围':'不属于当前主线优先范围'}</b><br><small>价格/资金：${sync}。${rr!=null&&rr>=1.5?'位置赔率尚可，仍需等验证。':'距离压力较近或支撑证据不足，优先等待。'}</small><br><small>继续观察条件：所属板块资金保持正向，且龙头/中军与该股相对强弱同步。</small><br><small>失效条件：跌破支撑1并伴随资金转负，或板块状态转弱；不构成买卖指令。</small>`}};const priorFinalRenderStock=renderStock;renderStock=function(){priorFinalRenderStock();finalStockOverlay()};finalStockOverlay();
 '''
@@ -1382,7 +1661,7 @@ def build():
     valuation_evidence_ui = valuation_evidence_ui.replace("method=/银行|保险/.test(x.industry)?'PB/ROE':/公用|电力|燃气|水务/.test(x.industry)?'DCF/股息':/半导体|电子设备|专用机械/.test(x.industry)?'PE/订单':/医药|生物/.test(x.industry)?'PE/管线':'PE+PB+FCFE'", "method='通用交叉估值（行业专用模型未启用）'")
     stock_trade_odds_ui = r'''const mountStockTradeOdds=()=>{const host=document.querySelector('#tradeLevels'),x=selectedStock,p=prices.filter(v=>v.ts_code===x.ts_code).sort((a,b)=>String(a.trade_date).localeCompare(String(b.trade_date)));if(!host||p.length<5)return;let box=host.querySelector('.stock-trade-odds');if(!box){box=document.createElement('div');box.className='stock-trade-odds';host.appendChild(box)}const current=Number(p.at(-1).close),windowRows=p.slice(-60),lows=[],highs=[];for(let i=2;i<p.length-2;i++){const lo=Number(p[i].low),hi=Number(p[i].high);if([p[i-2],p[i-1],p[i+1],p[i+2]].every(v=>lo<=Number(v.low)))lows.push(lo);if([p[i-2],p[i-1],p[i+1],p[i+2]].every(v=>hi>=Number(v.high)))highs.push(hi)}const support=lows.filter(v=>v<current).sort((a,b)=>b-a)[0]??Math.min(...windowRows.map(v=>Number(v.low)).filter(Number.isFinite)),resistance=highs.filter(v=>v>current).sort((a,b)=>a-b)[0]??Math.max(...windowRows.map(v=>Number(v.high)).filter(Number.isFinite)),trueRanges=p.slice(-15).map((v,i,a)=>{const prev=i?Number(a[i-1].close):Number(v.close);return Math.max(Number(v.high)-Number(v.low),Math.abs(Number(v.high)-prev),Math.abs(Number(v.low)-prev))}).filter(Number.isFinite),atr=trueRanges.length?trueRanges.reduce((a,b)=>a+b,0)/trueRanges.length:null,reward=Number.isFinite(resistance)?Math.max(0,resistance-current):null,risk=Number.isFinite(support)?Math.max(0,current-support):null,rr=risk&&reward?reward/risk:null,aligned=x.industry===summary.trade_sector||x.industry===summary.strongest_sector,flowOk=Number(x.net_mf_5d_yi)>0,structure=Number.isFinite(support)&&current<support&&Number(x.net_mf_5d_yi)<0?'价格跌破支撑且资金转负，逻辑受损风险上升':Number.isFinite(support)&&current>=support?'仍在支撑区间上方，暂按正常波动观察':'支撑证据不足，无法区分正常回调与逻辑破坏',role=Number(x.leader_score)>=Math.max(Number(x.core_score),Number(x.elastic_score))?'龙头候选':Number(x.core_score)>=Number(x.elastic_score)?'中军/趋势候选':'弹性/补涨候选',marketCap=Number(summary.position),singleCap=rr>=2&&aligned&&flowOk?marketCap*.4:rr>=1.2&&aligned?marketCap*.2:0,stop=Number.isFinite(support)?support-(atr||0)*.5:null,take=Number.isFinite(resistance)?resistance:null;box.innerHTML=`<div class="trade-odds-title">交易赔率与验证 <small>规则模型，不是个性化仓位建议</small></div><div class="trade-odds-grid"><div><span>主线一致性</span><b>${aligned?'符合当前优先方向':'不在当前优先方向'}</b></div><div><span>市场地位</span><b>${role}</b></div><div><span>结构判断</span><b>${structure}</b></div><div><span>预期收益 / 潜在风险</span><b>${reward!=null?fmt(reward/current*100)+'%':'—'} / ${risk!=null?fmt(risk/current*100)+'%':'—'}</b></div><div><span>观察盈亏比</span><b>${rr!=null?fmt(rr,2):'—'}</b></div><div><span>模型胜率</span><b>不可计算</b><small>缺少独立历史回测样本</small></div><div><span>单标的模型仓位上限</span><b>${singleCap?fmt(singleCap,0)+'%':'0%'}</b><small>由市场总仓位、主线、资金和盈亏比约束</small></div><div><span>止损 / 止盈观察价</span><b>${fmt(stop)} / ${fmt(take)}</b></div><div><span>触发条件</span><b>${Number.isFinite(resistance)?`放量站上 ${fmt(resistance)}，且板块资金和龙头/中军同步`:'等待形成有效压力位与资金共振'}</b></div><div><span>放弃条件</span><b>${Number.isFinite(support)?`跌破 ${fmt(support)} 且5日/当日资金转负`:'板块资金转负或相对行业继续走弱'}</b></div></div><small class="source">收益和风险按最近压力/支撑距离计算；止损参考=支撑位-0.5×ATR，止盈参考=最近压力位。模型仓位上限=市场总仓位×规则系数，不考虑个人资产、持仓和风险承受能力。</small>`};const priorTradeOddsRenderStock=renderStock;renderStock=function(){priorTradeOddsRenderStock();mountStockTradeOdds()};mountStockTradeOdds();const stockTradeOddsStyle=document.createElement('style');stockTradeOddsStyle.textContent='.stock-trade-odds{margin-top:9px;padding-top:8px;border-top:1px solid var(--line2)}.trade-odds-title{color:var(--gold);font-weight:700}.trade-odds-title small{color:var(--muted);font-weight:400;margin-left:6px}.trade-odds-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin-top:6px}.trade-odds-grid>div{background:var(--panel2);padding:6px;min-width:0}.trade-odds-grid span,.trade-odds-grid b,.trade-odds-grid small{display:block}.trade-odds-grid span,.trade-odds-grid small{color:var(--muted);font-size:10px}.trade-odds-grid b{font-size:11px;line-height:1.45;overflow-wrap:anywhere}';document.head.appendChild(stockTradeOddsStyle)
 '''
-    trade_plan_ui = stock_agent_ui + valuation_ui + valuation_evidence_ui + etf_share_ui + news_ui + news_switch_ui + news_detail_ui + news_objects_ui + overseas_corr_ui + stock_final_ui + stock_trade_odds_ui + news_link_ui + r'''
+    trade_plan_ui = stock_agent_ui + valuation_ui + valuation_evidence_ui + etf_share_ui + news_ui + news_switch_ui + news_detail_ui + news_objects_ui + news_chain_v2_ui + overseas_corr_ui + stock_final_ui + stock_trade_odds_ui + news_link_ui + r'''
 const tradePlanAnchor=document.querySelector('#overviewView .decision-grid');
 if(tradePlanAnchor&&!document.querySelector('#tradePlanPanel')){
   const panel=document.createElement('section');panel.id='tradePlanPanel';panel.className='panel change-panel';
