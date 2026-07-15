@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -34,12 +35,34 @@ def load_etfs():
         daily = pd.concat(rows, ignore_index=True)
         daily["trade_date"] = daily["trade_date"].astype(str)
         daily["close"] = pd.to_numeric(daily["close"], errors="coerce")
+        adj_rows = []
+        for adj_path in sorted((ROOT / "data").glob("fund_adj_*.csv")):
+            try:
+                adj = pd.read_csv(adj_path)
+                if {"ts_code", "adj_factor"}.issubset(adj.columns):
+                    if "trade_date" not in adj:
+                        adj["trade_date"] = adj_path.stem.split("_")[-1]
+                    adj["trade_date"] = adj["trade_date"].astype(str)
+                    adj["adj_factor"] = pd.to_numeric(adj["adj_factor"], errors="coerce")
+                    adj_rows.append(adj[["ts_code", "trade_date", "adj_factor"]])
+            except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+                continue
+        if adj_rows:
+            adjustment = pd.concat(adj_rows, ignore_index=True).drop_duplicates(["ts_code", "trade_date"], keep="last")
+            daily = daily.merge(adjustment, on=["ts_code", "trade_date"], how="left")
+            daily["adjusted_close"] = daily["close"] * daily["adj_factor"]
+        else:
+            daily["adj_factor"] = pd.NA
+            daily["adjusted_close"] = daily["close"]
         daily = daily.dropna(subset=["ts_code", "trade_date", "close"]).sort_values(["ts_code", "trade_date"])
         window_counts = daily.groupby("ts_code")["trade_date"].nunique().rename("window_days")
-        first = daily.groupby("ts_code", as_index=False).first()[["ts_code", "trade_date", "close"]].rename(columns={"trade_date":"start_date", "close":"start_close"})
-        last = daily.groupby("ts_code", as_index=False).last()[["ts_code", "trade_date", "close", "amount"]].rename(columns={"trade_date":"trade_date", "close":"close", "amount":"amount"})
+        first = daily.groupby("ts_code", as_index=False).first()[["ts_code", "trade_date", "close", "adjusted_close", "adj_factor"]].rename(columns={"trade_date":"start_date", "close":"start_close", "adjusted_close": "start_adjusted_close", "adj_factor": "start_adj_factor"})
+        last = daily.groupby("ts_code", as_index=False).last()[["ts_code", "trade_date", "close", "adjusted_close", "adj_factor", "amount"]].rename(columns={"amount":"amount", "adjusted_close": "latest_adjusted_close", "adj_factor": "latest_adj_factor"})
         out = basic.merge(last, on="ts_code", how="inner").merge(first, on="ts_code", how="left").merge(window_counts, on="ts_code", how="left")
+        has_adjustment = out["start_adjusted_close"].notna() & out["latest_adjusted_close"].notna()
         out["week_ret"] = (out["close"] / out["start_close"] - 1) * 100
+        out.loc[has_adjustment, "week_ret"] = (out.loc[has_adjustment, "latest_adjusted_close"] / out.loc[has_adjustment, "start_adjusted_close"] - 1) * 100
+        out["return_basis"] = has_adjustment.map({True: "基金复权因子调整收盘价", False: "未复权收盘价"})
         out.loc[out["trade_date"].astype(str) == out["start_date"].astype(str), "week_ret"] = pd.NA
         # TinyShare/Tushare fund_daily amount is in thousand yuan, same as stock daily amount.
         out["amount_yi"] = pd.to_numeric(out.get("amount"), errors="coerce") / 100000
@@ -95,6 +118,7 @@ def load_etfs():
             suspected_split = abnormal_return & (pd.to_numeric(out["share_change_pct"], errors="coerce").abs() > 30)
         else:
             suspected_split = abnormal_return & (pd.to_numeric(out["window_days"], errors="coerce") <= 5)
+        suspected_split = suspected_split & ~has_adjustment
         out.loc[suspected_split, "return_reliable"] = False
         out.loc[suspected_split, "data_quality_note"] = "价格与份额同时异常跳变，疑似份额折算/拆分；缺少复权依据，窗口收益不采用"
         out.loc[suspected_split, "week_ret"] = pd.NA
@@ -123,7 +147,7 @@ def load_etfs():
         out["tool_role"] = out.apply(classify_etf, axis=1)
         out["tool_relevance_score"] = (pd.to_numeric(out["amount_yi"], errors="coerce").clip(lower=0, upper=20) / 20 * 50 + out["benchmark"].fillna("").astype(str).str.len().clip(upper=20) / 20 * 20).round(1)
         out["selection_reason"] = out.apply(lambda r: f"{r['tool_role']}；成交额 {float(r['amount_yi']):.2f}亿" if pd.notna(r.get("amount_yi")) else f"{r['tool_role']}；成交额缺失", axis=1)
-        return records(out[[c for c in ["ts_code", "name", "fund_type", "benchmark", "invest_type", "issue_amount", "trade_date", "close", "week_ret", "window_days", "return_reliable", "data_quality_note", "amount_yi", "nav_date", "unit_nav", "accum_nav", "net_asset", "premium_discount", "share_date", "share_latest", "share_change", "share_change_pct", "component_count", "cpr_mean", "tool_role", "tool_relevance_score", "selection_reason"] if c in out]])
+        return records(out[[c for c in ["ts_code", "name", "fund_type", "benchmark", "invest_type", "issue_amount", "trade_date", "close", "week_ret", "window_days", "return_basis", "start_adj_factor", "latest_adj_factor", "return_reliable", "data_quality_note", "amount_yi", "nav_date", "unit_nav", "accum_nav", "net_asset", "premium_discount", "share_date", "share_latest", "share_change", "share_change_pct", "component_count", "cpr_mean", "tool_role", "tool_relevance_score", "selection_reason"] if c in out]])
     except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
         return []
 
@@ -149,6 +173,85 @@ def load_overseas():
         return rows
     except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
         return []
+
+
+def load_active_concepts():
+    flow_paths = sorted((ROOT / "data").glob("ths_moneyflow_*.csv"))
+    if not flow_paths:
+        return [], {}, {"available": False, "reason": "同花顺概念资金接口尚未返回可用快照"}
+    try:
+        flow = pd.read_csv(flow_paths[-1])
+        if not {"ts_code", "name"}.issubset(flow.columns):
+            raise KeyError("missing concept code/name")
+        for column in ["pct_change", "net_buy_amount", "net_sell_amount", "net_amount", "company_num", "pct_change_stock"]:
+            flow[column] = pd.to_numeric(flow.get(column), errors="coerce")
+        flow["activity_score"] = flow["net_amount"].abs().fillna(0) + flow["pct_change"].abs().fillna(0) * 5
+        flow = flow.sort_values("activity_score", ascending=False).drop_duplicates("ts_code").head(24)
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
+        return [], {}, {"available": False, "reason": "概念资金快照字段不完整"}
+
+    member_paths = sorted((ROOT / "data").glob("ths_active_members_*.csv"))
+    members = pd.DataFrame()
+    if member_paths:
+        try:
+            members = pd.read_csv(member_paths[-1])
+            stock_column = "con_code" if "con_code" in members.columns else None
+            if not stock_column or "concept_code" not in members.columns:
+                members = pd.DataFrame()
+            else:
+                members[stock_column] = members[stock_column].astype(str)
+                members["concept_code"] = members["concept_code"].astype(str)
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+            members = pd.DataFrame()
+
+    series_map = {}
+    history_paths = sorted((ROOT / "data").glob("ths_active_daily_*.csv"))
+    if history_paths:
+        try:
+            history = pd.read_csv(history_paths[-1])
+            history["trade_date"] = history["trade_date"].astype(str)
+            history["close"] = pd.to_numeric(history.get("close"), errors="coerce")
+            for code, group in history.dropna(subset=["ts_code", "trade_date", "close"]).groupby("ts_code"):
+                series_map[str(code)] = [[str(row.trade_date), round(float(row.close), 4)] for row in group.sort_values("trade_date").itertuples()]
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
+            series_map = {}
+
+    member_count = members.groupby("concept_code")["con_code"].nunique().to_dict() if not members.empty else {}
+    active = []
+    for row in flow.to_dict("records"):
+        code = str(row.get("ts_code") or "")
+        active.append({
+            "ts_code": code,
+            "name": row.get("name"),
+            "trade_date": str(row.get("trade_date") or ""),
+            "pct_change": row.get("pct_change"),
+            "net_amount": row.get("net_amount"),
+            "net_buy_amount": row.get("net_buy_amount"),
+            "net_sell_amount": row.get("net_sell_amount"),
+            "lead_stock": row.get("lead_stock"),
+            "lead_stock_ret": row.get("pct_change_stock"),
+            "reported_company_num": row.get("company_num"),
+            "mapped_member_count": int(member_count.get(code, 0)),
+            "price_series": series_map.get(code, []),
+        })
+
+    stock_concepts = {}
+    if not members.empty:
+        rank_map = {str(row.get("ts_code")): index for index, row in enumerate(flow.to_dict("records"))}
+        name_map = {str(row.get("ts_code")): str(row.get("name") or "") for row in flow.to_dict("records")}
+        for stock_code, group in members.groupby("con_code", sort=False):
+            codes = sorted(set(group["concept_code"].astype(str)), key=lambda code: rank_map.get(code, 9999))[:6]
+            stock_concepts[str(stock_code)] = [{"code": code, "name": name_map.get(code) or code} for code in codes]
+    meta = {
+        "available": bool(active),
+        "trade_date": active[0].get("trade_date") if active else None,
+        "active_count": len(active),
+        "mapped_stock_count": len(stock_concepts),
+        "coverage_note": "概念行情覆盖当日活跃排名；成分映射仅覆盖资金与涨跌活跃度前16个概念，不代表全市场概念全集。",
+    }
+    return active, stock_concepts, meta
+
+
 def load_data():
     sectors = pd.read_csv(ROOT / "output" / "sector_rotation.csv")
     stocks = pd.read_csv(ROOT / "output" / "stock_week_metrics.csv")
@@ -197,6 +300,10 @@ def load_data():
             pass
     price = pd.concat(prices, ignore_index=True).drop_duplicates(["ts_code", "trade_date"]) if prices else pd.DataFrame()
     etfs = load_etfs()
+    concepts, stock_concepts, concept_meta = load_active_concepts()
+    stocks["concepts"] = stocks["ts_code"].astype(str).map(lambda code: stock_concepts.get(code, []))
+    stocks["primary_concept"] = stocks["concepts"].map(lambda values: values[0]["name"] if values else None)
+    stocks["primary_concept_code"] = stocks["concepts"].map(lambda values: values[0]["code"] if values else None)
     if etfs:
         # ETF holdings make the table useful for selection: concentration and industry exposure
         # are derived only when the component snapshot contains real weights.
@@ -205,13 +312,26 @@ def load_data():
             try:
                 component = pd.read_csv(component_path)
                 if {"ts_code", "con_code"}.issubset(component.columns):
-                    keep = [c for c in ["ts_code", "con_code", "name", "weight"] if c in component.columns]
-                    component_rows.append(component[keep].copy())
+                    keep = [c for c in ["ts_code", "con_code", "con_name", "name", "weight", "qty", "cpr", "rdr", "sca", "exchange"] if c in component.columns]
+                    part = component[keep].copy()
+                    part["source_file"] = component_path.name
+                    component_rows.append(part)
             except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
                 continue
         if component_rows:
-            component = pd.concat(component_rows, ignore_index=True)
+            component = pd.concat(component_rows, ignore_index=True).drop_duplicates(["ts_code", "con_code"], keep="last")
             component["weight"] = pd.to_numeric(component.get("weight"), errors="coerce")
+            component["qty"] = pd.to_numeric(component.get("qty"), errors="coerce")
+            latest_close = pd.DataFrame(prices)
+            if not latest_close.empty and {"ts_code", "trade_date", "close"}.issubset(latest_close.columns):
+                latest_close["trade_date"] = latest_close["trade_date"].astype(str)
+                latest_close["close"] = pd.to_numeric(latest_close["close"], errors="coerce")
+                latest_close = latest_close.sort_values("trade_date").drop_duplicates("ts_code", keep="last")[["ts_code", "close"]]
+                component = component.merge(latest_close, left_on="con_code", right_on="ts_code", how="left", suffixes=("", "_stock_price"))
+                component["basket_market_value"] = component["qty"] * component["close"]
+                estimated_total = component.groupby("ts_code")["basket_market_value"].transform("sum")
+                estimated_weight = component["basket_market_value"] / estimated_total * 100
+                component["weight"] = component["weight"].where(component["weight"].notna(), estimated_weight)
             stock_lookup = stocks[[c for c in ["ts_code", "name", "industry"] if c in stocks.columns]].drop_duplicates("ts_code")
             component = component.merge(stock_lookup, left_on="con_code", right_on="ts_code", how="left", suffixes=("", "_stock"))
             exposure = []
@@ -224,10 +344,11 @@ def load_data():
                 if total and total > 0:
                     by_industry = ranked[ranked["industry"].notna()].groupby("industry")["weight"].sum().sort_values(ascending=False).head(5)
                     industry_exposure = [{"industry": str(k), "weight": round(float(v / total * 100), 2)} for k, v in by_industry.items()]
-                top_holdings = [{"name": str(row.get("name") or row.get("name_stock") or row.get("con_code")), "code": str(row.get("con_code")), "weight": round(float(row["weight"]), 2)} for _, row in ranked.head(10).iterrows()]
-                exposure.append({"ts_code": code, "component_count": int(group["con_code"].nunique()), "top10_weight": round(top10, 2) if top10 is not None else None, "weight_coverage": round(total, 2) if total is not None else None, "industry_exposure": industry_exposure, "top_holdings": top_holdings})
+                top_holdings = [{"name": str(row.get("con_name") or row.get("name") or row.get("name_stock") or row.get("con_code")), "code": str(row.get("con_code")), "weight": round(float(row["weight"]), 2)} for _, row in ranked.head(10).iterrows()]
+                basis = "PCF篮子数量×A股最新收盘价估算" if group["qty"].notna().any() else "接口直接提供权重"
+                exposure.append({"ts_code": code, "component_count": int(group["con_code"].nunique()), "top10_weight": round(top10, 2) if top10 is not None else None, "weight_coverage": round(total, 2) if total is not None else None, "component_weight_basis": basis, "industry_exposure": industry_exposure, "top_holdings": top_holdings})
             etf_frame = pd.DataFrame(etfs).merge(pd.DataFrame(exposure), on="ts_code", how="left", suffixes=("", "_derived"))
-            for column in ["component_count", "top10_weight", "weight_coverage", "industry_exposure", "top_holdings"]:
+            for column in ["component_count", "top10_weight", "weight_coverage", "component_weight_basis", "industry_exposure", "top_holdings"]:
                 derived = f"{column}_derived"
                 if derived in etf_frame:
                     etf_frame[column] = etf_frame[derived].where(etf_frame[derived].notna(), etf_frame.get(column))
@@ -257,7 +378,7 @@ def load_data():
     stock_flows = pd.concat(stock_flows, ignore_index=True) if stock_flows else pd.DataFrame(columns=["ts_code", "trade_date", "net_mf_yi"])
 
     sector_cols = ["rank", "industry", "state", "constituents", "week_ret", "median_ret", "net_mf_yi", "fri_flow_yi", "breadth", "turnover_yi", "flow_ratio", "limit_up", "broken", "limit_down", "strength"]
-    stock_cols = ["industry", "name", "ts_code", "market", "week_ret", "fri_ret", "net_mf_5d_yi", "net_mf_fri_yi", "circ_mv_yi", "turnover_yi", "turnover_rate", "pe", "pb", "U", "Z", "D", "leader_score", "core_score", "elastic_score", "ann_date", "eps", "bps", "fcfe_ps", "roe", "grossprofit_margin", "netprofit_margin", "debt_to_assets", "current_ratio", "q_ocf_to_sales", "q_sales_yoy", "netprofit_yoy", "ocf_yoy", "quality_score", "growth_score", "cash_score", "leverage_score", "valuation_score", "fundamental_coverage", "fundamental_score"]
+    stock_cols = ["industry", "name", "ts_code", "market", "week_ret", "fri_ret", "net_mf_5d_yi", "net_mf_fri_yi", "circ_mv_yi", "turnover_yi", "turnover_rate", "pe", "pb", "U", "Z", "D", "leader_score", "core_score", "elastic_score", "ann_date", "eps", "bps", "fcfe_ps", "roe", "grossprofit_margin", "netprofit_margin", "debt_to_assets", "current_ratio", "q_ocf_to_sales", "q_sales_yoy", "netprofit_yoy", "ocf_yoy", "quality_score", "growth_score", "cash_score", "leverage_score", "valuation_score", "fundamental_coverage", "fundamental_score", "concepts", "primary_concept", "primary_concept_code"]
     return (
         records(sectors[sector_cols]),
         records(stocks[stock_cols]),
@@ -266,11 +387,13 @@ def load_data():
         etfs,
         overseas,
         records(stock_flows),
+        concepts,
+        concept_meta,
     )
 
 
 def build():
-    sectors, stocks, flows, prices, etfs, overseas, stock_flows = load_data()
+    sectors, stocks, flows, prices, etfs, overseas, stock_flows, concepts, concept_meta = load_data()
     index_rows = []
     for path in sorted((ROOT / "data").glob("index_daily_*.csv")):
         try:
@@ -956,6 +1079,41 @@ def build():
                     "validation": "打开消息原文，并观察下一交易日板块、龙头/中军与对应ETF是否共同转强。",
                 })
     changes = sorted(changes, key=lambda x: abs(float(x.get("after") or 0) - float(x.get("before") or 0)), reverse=True)[:12]
+    change_history_path = ROOT / "data" / "change_history.json"
+    try:
+        change_history = json.loads(change_history_path.read_text(encoding="utf-8")) if change_history_path.exists() else []
+        change_history = change_history if isinstance(change_history, list) else []
+    except (OSError, json.JSONDecodeError):
+        change_history = []
+    latest_change_date = max([str(x.get("time") or "")[:8] for x in changes], default="")
+    history_by_id = {str(item.get("id")): item for item in change_history if item.get("id")}
+    active_change_ids = set()
+    for change in changes:
+        identity = f"{change.get('category') or ''}|{change.get('title') or ''}"
+        change_id = hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12]
+        active_change_ids.add(change_id)
+        prior = history_by_id.get(change_id, {})
+        same_observation = str(prior.get("last_seen") or "") == str(change.get("time") or "")
+        record = {
+            "id": change_id,
+            "category": change.get("category"),
+            "title": change.get("title"),
+            "first_seen": prior.get("first_seen") or change.get("time") or generated_at,
+            "last_seen": change.get("time") or generated_at,
+            "occurrences": int(prior.get("occurrences") or 0) + (0 if same_observation else 1),
+            "status": "当前存在",
+            "latest": change,
+        }
+        history_by_id[change_id] = record
+        change.update({"id": change_id, "first_seen": record["first_seen"], "occurrences": record["occurrences"], "history_status": record["status"]})
+    for change_id, record in history_by_id.items():
+        if change_id not in active_change_ids and latest_change_date and str(record.get("last_seen") or "")[:8] < latest_change_date:
+            record["status"] = "已解除/未再触发"
+    change_history = sorted(history_by_id.values(), key=lambda item: str(item.get("last_seen") or ""), reverse=True)[:120]
+    try:
+        change_history_path.write_text(json.dumps(change_history, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
     summary = {
         "stock_count": len(stocks),
         "sector_count": len(sectors),
@@ -975,6 +1133,8 @@ def build():
         "etf_count": len(etfs),
         "etf_quality_excluded": sum(1 for x in etfs if x.get("return_reliable") is False),
         "etf_window": sorted({str(x.get("trade_date")) for x in etfs if x.get("trade_date")}),
+        "active_concepts": concepts,
+        "concept_meta": concept_meta,
         "market_state": market_state,
         "market_state_evidence": state_evidence,
         "index_week_ret": index_week_ret,
@@ -1005,6 +1165,7 @@ def build():
         "high_low_switch": high_low_switch,
         "market_price_series": market_price_series,
         "changes": changes,
+        "change_history": change_history,
         "overseas_conduction": overseas_conduction,
         "flow_periods": [{"period": "5分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "15分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "30分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "当日", "available": bool(market_flow_series), "reason": "按板块日级主力净流合计"}, {"period": "3日", "available": len(market_flow_series) >= 3, "reason": "按最近可用交易日合计"}, {"period": "5日", "available": len(market_flow_series) >= 5, "reason": "按最近可用交易日合计"}, {"period": "20日", "available": len(market_flow_series) >= 20, "reason": "按最近20个可用交易日合计" if len(market_flow_series) >= 20 else f"当前仅有{len(market_flow_series)}个交易日资金明细"}],
         "proxy_funds": proxy_funds,
@@ -1116,6 +1277,7 @@ def build():
 '''
     etf_observer_ui = r'''const mountEtfEvidence=()=>{const host=document.querySelector('#etfBoard');if(!host||!etfs.length)return;let panel=host.querySelector('#etfSelectedEvidence');if(!panel){panel=document.createElement('div');panel.id='etfSelectedEvidence';panel.className='etf-selected-evidence';host.appendChild(panel)}const rows=[...host.querySelectorAll('tbody tr')],render=i=>{const x=etfs[i]||etfs[0];if(!x)return;panel.innerHTML='<div class="etf-selected-title">ETF观察证据 <small>'+escHtml(x.name||x.ts_code||'')+'</small></div><div class="etf-selected-grid"><div><span>观察理由</span><b>'+escHtml(x.selection_reason||x.tool_role||'暂无')+'</b></div><div><span>跟踪基准</span><b>'+escHtml(x.benchmark||'未提供')+'</b></div><div><span>收盘 / 窗口涨跌</span><b>'+fmt(x.close)+' / '+fmt(x.week_ret)+'%</b></div><div><span>成交额 / 溢折价</span><b>'+fmt(x.amount_yi)+'亿 / '+fmt(x.premium_discount)+'%</b></div><div><span>成分数 / 前十大权重</span><b>'+fmt(x.component_count,0)+' / '+fmt(x.top10_weight,1)+'%</b></div><div><span>基金份额变化</span><b>'+fmt(x.share_change_pct,2)+'%</b></div><div><span>行业暴露前五</span><b>'+((x.industry_exposure||[]).slice(0,5).map(v=>escHtml(v.industry)+' '+fmt(v.weight,1)+'%').join(' · ')||'未提供')+'</b></div><div><span>海外联动</span><b>'+(x.overseas_asset?escHtml(x.overseas_asset)+' · 5日 '+fmt(x.overseas_ret_5d)+'%':'暂无可验证海外联动')+'</b></div></div><small class="source">ETF是指数、行业和流动性观察工具；成交额不等于申赎资金，份额变化不等于纯申购赎回。</small>'};rows.forEach((row,i)=>{if(row.dataset.etfEvidenceBound)return;row.dataset.etfEvidenceBound='1';row.onclick=()=>{rows.forEach(r=>r.classList.remove('etf-selected-row'));row.classList.add('etf-selected-row');render(i)}});render(0);if(!host.dataset.etfObserver){host.dataset.etfObserver='1';new MutationObserver(mountEtfEvidence).observe(host,{childList:true})}};mountEtfEvidence();setInterval(mountEtfEvidence,1000);const etfObserverStyle=document.createElement('style');etfObserverStyle.textContent='.etf-selected-evidence{margin-top:9px;padding:10px;background:var(--panel2);border-top:2px solid var(--gold)}.etf-selected-title{font-weight:700;color:var(--gold);margin-bottom:7px}.etf-selected-title small{color:var(--text);margin-left:8px}.etf-selected-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}.etf-selected-grid>div{padding:6px;background:var(--panel)}.etf-selected-grid span,.etf-selected-grid b{display:block}.etf-selected-grid span{color:var(--muted);font-size:10px}.etf-selected-grid b{font-size:11px;line-height:1.45;overflow-wrap:anywhere}.etf-selected-row{background:#263442!important;outline:1px solid var(--gold)}@media(max-width:900px){.etf-selected-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}';document.head.appendChild(etfObserverStyle)
 '''
+    etf_observer_ui = etf_observer_ui.replace("setInterval(mountEtfEvidence,1000);", "")
     valuation_evidence_ui = r'''const valuationEvidenceStyle=document.createElement('style');valuationEvidenceStyle.textContent='.valuation-evidence{margin-top:8px;padding:9px;background:var(--panel2);border-top:2px solid var(--gold);line-height:1.55}.valuation-evidence-title{color:var(--gold);font-weight:700;margin-bottom:6px}.valuation-evidence-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px}.valuation-evidence-grid>div{background:var(--panel);padding:6px;min-width:0}.valuation-evidence-grid span,.valuation-evidence-grid b{display:block}.valuation-evidence-grid span{color:var(--muted);font-size:10px}.valuation-evidence-grid b{font-size:11px;overflow-wrap:anywhere}.valuation-risk{color:var(--down)}@media(max-width:900px){.valuation-evidence-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}';document.head.appendChild(valuationEvidenceStyle);const mountValuationEvidence=()=>{const host=document.querySelector('.valuation-form');if(!host||!selectedStock)return;let box=document.querySelector('#valuationEvidence');if(!box){box=document.createElement('div');box.id='valuationEvidence';box.className='valuation-evidence';host.appendChild(box)}const x=selectedStock,pe=Number(x.pe),pb=Number(x.pb),peers=stocks.filter(v=>v.industry===x.industry),nums=f=>peers.map(v=>Number(v[f])).filter(v=>Number.isFinite(v)&&v>0).sort((a,b)=>a-b),rank=(v,arr)=>v>0&&arr.length?Math.round((arr.filter(z=>z<=v).length/arr.length)*100):null,q=(v,suffix='')=>v===null||v===undefined||!Number.isFinite(Number(v))?'未提供':fmt(v)+suffix,peArr=nums('pe'),pbArr=nums('pb'),method=/银行|保险/.test(x.industry)?'PB/ROE':/公用|电力|燃气|水务/.test(x.industry)?'DCF/股息':/半导体|电子设备|专用机械/.test(x.industry)?'PE/订单':/医药|生物/.test(x.industry)?'PE/管线':'PE+PB+FCFE',risk=Number(x.debt_to_assets)>70?'负债率较高，估值对利率和现金流更敏感':Number(x.netprofit_yoy)<0?'净利润同比为负，盈利假设可能下修':Number(x.q_sales_yoy)<0?'营收同比为负，成长假设可能下修':Number(x.fcfe_ps)<=0?'FCFE缺失或非正，现金流折现参考性有限':'周期、一次性损益和行业估值切换仍是主要风险';box.innerHTML='<div class="valuation-evidence-title">估值依据与数据边界 <small>当前仅作区间观察</small></div><div class="valuation-evidence-grid"><div><span>估值方法</span><b>'+method+'</b></div><div><span>财务期/公告日</span><b>'+q(x.ann_date)+'</b></div><div><span>EPS / BPS / FCFE</span><b>'+q(Number(x.eps))+' / '+q(Number(x.bps))+' / '+q(Number(x.fcfe_ps))+'</b></div><div><span>ROE / 毛利率 / 净利率</span><b>'+q(Number(x.roe),'%')+' / '+q(Number(x.grossprofit_margin),'%')+' / '+q(Number(x.netprofit_margin),'%')+'</b></div><div><span>营收同比 / 净利同比</span><b>'+q(Number(x.q_sales_yoy),'%')+' / '+q(Number(x.netprofit_yoy),'%')+'</b></div><div><span>同行样本数量</span><b>'+peers.length+' 家（'+escHtml(x.industry||'未分类')+'）</b></div><div><span>当前 PE / 同行分位</span><b>'+q(pe)+' / '+q(rank(pe,peArr),'%')+'</b></div><div><span>当前 PB / 同行分位</span><b>'+q(pb)+' / '+q(rank(pb,pbArr),'%')+'</b></div><div><span>总股本/历史估值分位</span><b>未提供 / 未提供</b></div><div><span>最大风险</span><b class="valuation-risk">'+risk+'</b></div></div><small class="source">区间由可编辑的 EPS、BPS、FCFE、同行 PE/PB 和增长/折现假设计算；同行分位只是当前样本横截面，不等于历史分位。没有接口证据的总股本、历史分位和行业专用模型不填数字。</small>'};mountValuationEvidence();const priorEvidenceRenderStock=renderStock;renderStock=function(){priorEvidenceRenderStock();setTimeout(mountValuationEvidence,0)};document.querySelectorAll('.valuation-form input').forEach(i=>i.addEventListener('input',mountValuationEvidence));'''
     valuation_evidence_ui = valuation_evidence_ui.replace("method=/银行|保险/.test(x.industry)?'PB/ROE':/公用|电力|燃气|水务/.test(x.industry)?'DCF/股息':/半导体|电子设备|专用机械/.test(x.industry)?'PE/订单':/医药|生物/.test(x.industry)?'PE/管线':'PE+PB+FCFE'", "method='通用交叉估值（行业专用模型未启用）'")
     stock_trade_odds_ui = r'''const mountStockTradeOdds=()=>{const host=document.querySelector('#tradeLevels'),x=selectedStock,p=prices.filter(v=>v.ts_code===x.ts_code).sort((a,b)=>String(a.trade_date).localeCompare(String(b.trade_date)));if(!host||p.length<5)return;let box=host.querySelector('.stock-trade-odds');if(!box){box=document.createElement('div');box.className='stock-trade-odds';host.appendChild(box)}const current=Number(p.at(-1).close),windowRows=p.slice(-60),lows=[],highs=[];for(let i=2;i<p.length-2;i++){const lo=Number(p[i].low),hi=Number(p[i].high);if([p[i-2],p[i-1],p[i+1],p[i+2]].every(v=>lo<=Number(v.low)))lows.push(lo);if([p[i-2],p[i-1],p[i+1],p[i+2]].every(v=>hi>=Number(v.high)))highs.push(hi)}const support=lows.filter(v=>v<current).sort((a,b)=>b-a)[0]??Math.min(...windowRows.map(v=>Number(v.low)).filter(Number.isFinite)),resistance=highs.filter(v=>v>current).sort((a,b)=>a-b)[0]??Math.max(...windowRows.map(v=>Number(v.high)).filter(Number.isFinite)),trueRanges=p.slice(-15).map((v,i,a)=>{const prev=i?Number(a[i-1].close):Number(v.close);return Math.max(Number(v.high)-Number(v.low),Math.abs(Number(v.high)-prev),Math.abs(Number(v.low)-prev))}).filter(Number.isFinite),atr=trueRanges.length?trueRanges.reduce((a,b)=>a+b,0)/trueRanges.length:null,reward=Number.isFinite(resistance)?Math.max(0,resistance-current):null,risk=Number.isFinite(support)?Math.max(0,current-support):null,rr=risk&&reward?reward/risk:null,aligned=x.industry===summary.trade_sector||x.industry===summary.strongest_sector,flowOk=Number(x.net_mf_5d_yi)>0,structure=Number.isFinite(support)&&current<support&&Number(x.net_mf_5d_yi)<0?'价格跌破支撑且资金转负，逻辑受损风险上升':Number.isFinite(support)&&current>=support?'仍在支撑区间上方，暂按正常波动观察':'支撑证据不足，无法区分正常回调与逻辑破坏',role=Number(x.leader_score)>=Math.max(Number(x.core_score),Number(x.elastic_score))?'龙头候选':Number(x.core_score)>=Number(x.elastic_score)?'中军/趋势候选':'弹性/补涨候选',marketCap=Number(summary.position),singleCap=rr>=2&&aligned&&flowOk?marketCap*.4:rr>=1.2&&aligned?marketCap*.2:0,stop=Number.isFinite(support)?support-(atr||0)*.5:null,take=Number.isFinite(resistance)?resistance:null;box.innerHTML=`<div class="trade-odds-title">交易赔率与验证 <small>规则模型，不是个性化仓位建议</small></div><div class="trade-odds-grid"><div><span>主线一致性</span><b>${aligned?'符合当前优先方向':'不在当前优先方向'}</b></div><div><span>市场地位</span><b>${role}</b></div><div><span>结构判断</span><b>${structure}</b></div><div><span>预期收益 / 潜在风险</span><b>${reward!=null?fmt(reward/current*100)+'%':'—'} / ${risk!=null?fmt(risk/current*100)+'%':'—'}</b></div><div><span>观察盈亏比</span><b>${rr!=null?fmt(rr,2):'—'}</b></div><div><span>模型胜率</span><b>不可计算</b><small>缺少独立历史回测样本</small></div><div><span>单标的模型仓位上限</span><b>${singleCap?fmt(singleCap,0)+'%':'0%'}</b><small>由市场总仓位、主线、资金和盈亏比约束</small></div><div><span>止损 / 止盈观察价</span><b>${fmt(stop)} / ${fmt(take)}</b></div><div><span>触发条件</span><b>${Number.isFinite(resistance)?`放量站上 ${fmt(resistance)}，且板块资金和龙头/中军同步`:'等待形成有效压力位与资金共振'}</b></div><div><span>放弃条件</span><b>${Number.isFinite(support)?`跌破 ${fmt(support)} 且5日/当日资金转负`:'板块资金转负或相对行业继续走弱'}</b></div></div><small class="source">收益和风险按最近压力/支撑距离计算；止损参考=支撑位-0.5×ATR，止盈参考=最近压力位。模型仓位上限=市场总仓位×规则系数，不考虑个人资产、持仓和风险承受能力。</small>`};const priorTradeOddsRenderStock=renderStock;renderStock=function(){priorTradeOddsRenderStock();mountStockTradeOdds()};mountStockTradeOdds();const stockTradeOddsStyle=document.createElement('style');stockTradeOddsStyle.textContent='.stock-trade-odds{margin-top:9px;padding-top:8px;border-top:1px solid var(--line2)}.trade-odds-title{color:var(--gold);font-weight:700}.trade-odds-title small{color:var(--muted);font-weight:400;margin-left:6px}.trade-odds-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin-top:6px}.trade-odds-grid>div{background:var(--panel2);padding:6px;min-width:0}.trade-odds-grid span,.trade-odds-grid b,.trade-odds-grid small{display:block}.trade-odds-grid span,.trade-odds-grid small{color:var(--muted);font-size:10px}.trade-odds-grid b{font-size:11px;line-height:1.45;overflow-wrap:anywhere}';document.head.appendChild(stockTradeOddsStyle)
@@ -1134,6 +1296,27 @@ if(tradePlanAnchor&&!document.querySelector('#tradePlanPanel')){
 const sectorAgentBox=document.querySelector('#sectorAgentChart')?.parentElement;if(sectorAgentBox&&!document.querySelector('#sectorAgentCurrent')){const box=document.createElement('div');box.id='sectorAgentCurrent';box.className='agent-current';sectorAgentBox.appendChild(box);const render=()=>{const rows=selectedSector?.agent_flows||[];box.innerHTML='<div class="agent-current-title">当前板块代理资金明细 <small>按订单规模与股票特征回算；估算，不代表账户归属</small></div>'+rows.map(x=>`<div class="agent-current-row"><span>${escHtml(x.name)}<small>${escHtml(x.basis||'')} · ${escHtml(x.window||'可用窗口')} · 覆盖 ${fmt(x.coverage,0)} 家</small></span><b class="${cls(x.value)}">${fmt(x.value)}亿</b><em>${escHtml(x.direction||'暂无数据')}</em></div>`).join('')||'<div class="empty">暂无足够覆盖数据</div>'};const prior=renderSector;renderSector=function(){prior();render()};render()}
 const agentCurrentStyle=document.createElement('style');agentCurrentStyle.textContent='.agent-current{padding:9px;border-top:1px solid var(--line2)}.agent-current-title{color:var(--gold);font-weight:700;margin-bottom:5px}.agent-current-title small{color:var(--muted);font-weight:400;margin-left:8px}.agent-current-row{display:grid;grid-template-columns:1fr 80px 60px;gap:7px;padding:6px 0;border-bottom:1px solid var(--line2);font-size:12px}.agent-current-row small{display:block;color:var(--muted);font-size:10px;margin-top:2px}.agent-current-row b{text-align:right}.agent-current-row em{text-align:right;font-style:normal;color:var(--muted)}';document.head.appendChild(agentCurrentStyle)
 ''' + etf_observer_ui
+    concept_change_ui = r'''
+const activeConcepts=summary.active_concepts||[],conceptMeta=summary.concept_meta||{};
+const rotationHost=document.querySelector('#rotationView .rotation-bottom');
+if(rotationHost&&!document.querySelector('#conceptPanel')){
+  const panel=document.createElement('section');panel.id='conceptPanel';panel.className='panel concept-panel';
+  panel.innerHTML='<div class="head">活跃概念与资金 <small>同花顺概念口径；点击查看真实成分覆盖</small></div><div class="concept-layout"><div id="conceptChart" class="chart"></div><div id="conceptDetail" class="concept-detail"></div></div>';
+  rotationHost.parentNode.insertBefore(panel,rotationHost);
+  const chart=echarts.init(panel.querySelector('#conceptChart')),rows=activeConcepts.slice(0,14),names=rows.map(x=>x.name).reverse(),values=rows.map(x=>Number(x.net_amount)).reverse();charts.conceptChart=chart;
+  chart.setOption({animation:false,tooltip:{...tooltip,trigger:'axis',axisPointer:{type:'shadow'}},grid:{left:105,right:26,top:16,bottom:28},xAxis:{type:'value',name:'亿元',axisLabel:{color:C.muted},splitLine:{lineStyle:{color:'#24303a'}}},yAxis:{type:'category',data:names,axisLabel:{color:C.text,width:94,overflow:'truncate'}},series:[{type:'bar',data:values,itemStyle:{color:p=>Number(p.value)>=0?C.up:C.down}}]});
+  const detail=panel.querySelector('#conceptDetail'),renderConcept=index=>{const x=rows[index]||rows[0];if(!x){detail.innerHTML='<div class="empty">概念接口未返回可用数据</div>';return}const members=stocks.filter(s=>(s.concepts||[]).some(c=>c.code===x.ts_code)).sort((a,b)=>Number(b.week_ret||0)-Number(a.week_ret||0)).slice(0,10);detail.innerHTML=`<div class="concept-title"><b>${escHtml(x.name)}</b><small>${escHtml(x.ts_code)} · ${escHtml(x.trade_date||'日期未知')}</small></div><div class="concept-kpis"><span>涨跌 <b class="${cls(x.pct_change)}">${fmt(x.pct_change)}%</b></span><span>净流 <b class="${cls(x.net_amount)}">${fmt(x.net_amount)}亿</b></span><span>接口公司数 <b>${fmt(x.reported_company_num,0)}</b></span><span>本地映射 <b>${fmt(x.mapped_member_count,0)}</b></span></div><div class="concept-lead">接口领涨：${escHtml(x.lead_stock||'未提供')} ${fmt(x.lead_stock_ret)}%</div><div class="concept-members">${members.map(s=>`<button data-concept-stock="${escHtml(s.ts_code)}"><span>${escHtml(s.name)}</span><b class="${cls(s.week_ret)}">${fmt(s.week_ret)}%</b></button>`).join('')||'<small>该概念不在当前活跃成分抓取覆盖内</small>'}</div><small class="source">${escHtml(conceptMeta.coverage_note||conceptMeta.reason||'缺少覆盖说明')}</small>`;detail.querySelectorAll('[data-concept-stock]').forEach(b=>b.onclick=()=>selectStock(b.dataset.conceptStock,true))};
+  chart.on('click',p=>{const index=rows.findIndex(x=>x.name===p.name);renderConcept(index)});renderConcept(0);
+}
+const priorConceptEvidence=renderStockEvidence;
+renderStockEvidence=function(){priorConceptEvidence();const x=selectedStock,p=prices.filter(v=>v.ts_code===x.ts_code).sort((a,b)=>String(a.trade_date).localeCompare(String(b.trade_date))),concept=activeConcepts.find(v=>v.ts_code===x.primary_concept_code),status=document.querySelector('#relativeStrengthStatus'),conceptCell=status?.querySelector('span:last-child');if(!concept||!concept.price_series?.length||!p.length){if(conceptCell)conceptCell.innerHTML='概念比较<b>当前活跃概念成分未覆盖</b>';return}const dates=p.map(v=>String(v.trade_date)),lookup=Object.fromEntries(concept.price_series.map(v=>[String(v[0]),Number(v[1])])),first=dates.map(d=>lookup[d]).find(Number.isFinite),line=dates.map(d=>Number.isFinite(lookup[d])&&Number.isFinite(first)?lookup[d]/first*100:null),stockBase=Number(p[0].close),stockLast=Number(p.at(-1).close)/stockBase*100,conceptLast=[...line].reverse().find(Number.isFinite),option=stockEvidenceChart.getOption(),name='概念：'+concept.name;option.legend[0].data.push(name);option.series.push({name,type:'line',data:line,showSymbol:false,lineStyle:{color:'#f08a5d',type:'dotted'}});stockEvidenceChart.setOption(option,true);if(conceptCell)conceptCell.innerHTML=`相对概念 ${escHtml(concept.name)}<b class="${cls(stockLast-conceptLast)}">${fmt(stockLast-conceptLast,2)}点</b>`};
+renderStockEvidence();
+const changesHost=document.querySelector('#changeList');
+if(changesHost&&!document.querySelector('#changeModeSwitch')){const sw=document.createElement('div');sw.id='changeModeSwitch';sw.className='change-mode-switch';sw.innerHTML='<button class="btn active" data-change-mode="active">当前异动</button><button class="btn" data-change-mode="history">变化历史</button>';changesHost.parentNode.insertBefore(sw,changesHost);const renderChanges=mode=>{const rows=mode==='history'?(summary.change_history||[]):(summary.changes||[]);changesHost.innerHTML=rows.map(item=>{const x=mode==='history'?(item.latest||{}):item;return `<div class="change-item"><b>${escHtml(item.title||x.title||'未知变化')}</b><small>${escHtml(item.category||x.category||'变化')} · ${mode==='history'?`首次 ${escHtml(item.first_seen||'未知')} · 最近 ${escHtml(item.last_seen||'未知')} · 出现 ${fmt(item.occurrences,0)} 次 · ${escHtml(item.status||'未知')}`:`${escHtml(x.time||'未知时间')} · ${escHtml(x.before_text||('前值 '+fmt(x.before)))} → ${escHtml(x.after_text||('后值 '+fmt(x.after)))}`}</small><em>${escHtml(x.meaning||'暂无解释')}</em><small>置信度：${escHtml(x.confidence||'低')} · 验证：${escHtml(x.validation||'暂无')}</small></div>`}).join('')||'<div class="empty">暂无达到阈值的记录</div>'};sw.querySelectorAll('button').forEach(b=>b.onclick=()=>{sw.querySelectorAll('button').forEach(x=>x.classList.toggle('active',x===b));renderChanges(b.dataset.changeMode)});renderChanges('active')}
+const enhanceEtfEvidence=()=>{const panel=document.querySelector('#etfSelectedEvidence');if(!panel||panel.querySelector('.etf-data-basis'))return;const selected=[...document.querySelectorAll('#etfBoard tbody tr')].findIndex(row=>row.classList.contains('etf-selected-row')),x=etfs[selected>=0?selected:0];if(!x)return;panel.insertAdjacentHTML('beforeend',`<div class="source etf-data-basis"><b>数据口径</b>：窗口收益=${escHtml(x.return_basis||'未复权收盘价')}；成分权重=${escHtml(x.component_weight_basis||'接口未提供可计算权重')}；净值日=${escHtml(x.nav_date||'未提供')}；复权因子 ${fmt(x.start_adj_factor,4)} → ${fmt(x.latest_adj_factor,4)}。</div>`)};document.querySelector('#etfBoard')?.addEventListener('click',()=>setTimeout(enhanceEtfEvidence,0));setTimeout(enhanceEtfEvidence,0);
+const conceptStyle=document.createElement('style');conceptStyle.textContent='.concept-panel{height:390px;margin-bottom:7px}.concept-layout{display:grid;grid-template-columns:1.35fr .85fr;height:calc(100% - 39px)}.concept-detail{padding:10px;border-left:1px solid var(--line);overflow:auto}.concept-title b,.concept-title small{display:block}.concept-title b{color:var(--gold);font-size:15px}.concept-title small,.concept-lead{color:var(--muted);margin-top:4px}.concept-kpis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin:8px 0}.concept-kpis span{padding:6px;background:var(--panel2);color:var(--muted);font-size:10px}.concept-kpis b{display:block;font-size:13px}.concept-members{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;margin:8px 0}.concept-members button{display:flex;justify-content:space-between;gap:5px;border:1px solid var(--line);background:var(--panel2);color:var(--text);padding:6px;text-align:left;cursor:pointer}.change-mode-switch{display:flex;gap:5px;padding:7px 9px;border-bottom:1px solid var(--line)}.etf-data-basis b{color:var(--gold)}@media(max-width:900px){.concept-panel{height:auto}.concept-layout{grid-template-columns:1fr;height:auto}.concept-layout>.chart{height:320px}.concept-detail{border-left:0;border-top:1px solid var(--line)}}';document.head.appendChild(conceptStyle);
+'''
+    trade_plan_ui += concept_change_ui
     template = template.replace('</script></body></html>', trade_plan_ui + '</script></body></html>')
     OUT.mkdir(parents=True, exist_ok=True)
     history_out = OUT / "history"
