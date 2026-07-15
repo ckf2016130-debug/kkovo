@@ -39,6 +39,7 @@ def load_etfs():
         last = daily.groupby("ts_code", as_index=False).last()[["ts_code", "trade_date", "close", "amount"]].rename(columns={"trade_date":"trade_date", "close":"close", "amount":"amount"})
         out = basic.merge(last, on="ts_code", how="inner").merge(first, on="ts_code", how="left")
         out["week_ret"] = (out["close"] / out["start_close"] - 1) * 100
+        out.loc[out["trade_date"].astype(str) == out["start_date"].astype(str), "week_ret"] = pd.NA
         # TinyShare/Tushare fund_daily amount is in thousand yuan, same as stock daily amount.
         out["amount_yi"] = pd.to_numeric(out.get("amount"), errors="coerce") / 100000
         # Keep ETFs with actual market reference value; debt, currency and tiny inactive samples are noise here.
@@ -78,11 +79,14 @@ def load_etfs():
                 continue
         if share_rows:
             shares = pd.concat(share_rows, ignore_index=True).dropna(subset=["share_value"]).sort_values(["ts_code", "share_date"])
+            share_date_count = shares.groupby("ts_code")["share_date"].nunique()
             share_first = shares.groupby("ts_code", as_index=False).first()[["ts_code", "share_value"]].rename(columns={"share_value": "share_start"})
             share_last = shares.groupby("ts_code", as_index=False).last()[["ts_code", "share_date", "share_value"]].rename(columns={"share_value": "share_latest"})
             out = out.merge(share_last, on="ts_code", how="left").merge(share_first, on="ts_code", how="left")
             out["share_change"] = out["share_latest"] - out["share_start"]
             out["share_change_pct"] = (out["share_latest"] / out["share_start"] - 1) * 100
+            insufficient_share_history = out["ts_code"].map(share_date_count).fillna(0) < 2
+            out.loc[insufficient_share_history, ["share_change", "share_change_pct"]] = pd.NA
         component_rows = []
         for component_path in sorted((ROOT / "data").glob("etf_*_cons_*.csv")):
             try:
@@ -551,18 +555,20 @@ def build():
     chain_etf = next((x for x in etfs if chain_sector and (chain_sector in str(x.get("name") or "") or chain_sector in str(x.get("benchmark") or ""))), None)
     logic_chain = []
     if overseas_lead:
-        logic_chain.append({"label": "海外变量", "value": overseas_lead.get("asset"), "evidence": f"5日 {overseas_lead.get('ret_5d')}% · 映射 { '、'.join(overseas_lead.get('targets') or []) } · {overseas_lead.get('state')}", "action": "overseas"})
+        logic_chain.append({"label": "海外变量", "value": overseas_lead.get("asset"), "evidence": f"5日 {overseas_lead.get('ret_5d')}% · 映射 { '、'.join(overseas_lead.get('targets') or []) } · {overseas_lead.get('state')}", "confidence": "中", "action": "overseas"})
     else:
-        logic_chain.append({"label": "海外变量", "value": "暂无可验证海外变量", "evidence": "当前快照没有同时满足价格、映射和相关性条件的海外证据；不把缺失信息当作利多或利空", "action": "overseas"})
-    logic_chain.append({"label": "国内消息", "value": chain_head.get("title") if chain_head else "暂无高价值消息", "evidence": f"时间 {chain_head.get('time')} · 价值 {chain_head.get('value_score')} · 可信度 {chain_head.get('trust_score')}" if chain_head else "暂无真实消息", "action": "news", "url": chain_head.get("url") if chain_head else None})
+        logic_chain.append({"label": "海外变量", "value": "暂无可验证海外变量", "evidence": "当前快照没有同时满足价格、映射和相关性条件的海外证据；不把缺失信息当作利多或利空", "confidence": "低", "action": "overseas"})
+    news_confidence = "高" if chain_head and float(chain_head.get("trust_score") or 0) >= 80 else "中" if chain_head and float(chain_head.get("trust_score") or 0) >= 60 else "低"
+    logic_chain.append({"label": "国内消息", "value": chain_head.get("title") if chain_head else "暂无高价值消息", "evidence": f"时间 {chain_head.get('time')} · 价值 {chain_head.get('value_score')} · 可信度 {chain_head.get('trust_score')}" if chain_head else "暂无真实消息", "confidence": news_confidence, "edge_evidence": "海外与国内消息只按发布时间和产业映射建立候选关系，尚不能确认因果", "action": "news", "url": chain_head.get("url") if chain_head else None})
     fund_sector = chain_sector if chain_sector in sector_map else lead_in
-    fund_value = float(sector_map.get(fund_sector, {}).get("net_mf_yi") or 0) if fund_sector else None
+    fund_raw = sector_map.get(fund_sector, {}).get("net_mf_yi") if fund_sector else None
+    fund_value = float(fund_raw) if fund_raw is not None and pd.notna(fund_raw) else None
     fund_relation = "与消息映射板块一致" if fund_sector and fund_sector == chain_sector else "与消息映射板块不同，当前仅作市场资金方向参考"
     logic_chain.extend([
-        {"label": "影响板块", "value": chain_sector or "未映射", "evidence": f"{chain_head.get('impact_type')} · {chain_head.get('impact_scope')}" if chain_head else "暂无消息映射证据", "action": "sector", "target": chain_sector},
-        {"label": "资金验证", "value": fund_sector or "暂无承接方向", "evidence": f"板块5日净流 {fund_value:.2f}亿 · {fund_relation}" if fund_value is not None else "暂无数据", "action": "sector", "target": fund_sector},
-        {"label": "个股/ETF价格", "value": (chain_stock.get("name") if chain_stock is not None else chain_etf.get("name") if chain_etf else "暂无可映射标的"), "evidence": f"个股等权 {mean_ret:.2f}% · 上涨宽度 {breadth:.1f}%" if breadth is not None else "暂无价格证据", "action": "stock" if chain_stock is not None else "overview", "target": chain_stock.get("ts_code") if chain_stock is not None else None},
-        {"label": "验证", "value": "价格与资金初步认可" if chain_head and chain_head.get("market_acceptance") == "价格与资金初步认可" else "尚不能确认因果", "evidence": "下一交易日复核板块资金、龙头/中军与ETF是否同步；时间相关性不等于因果", "action": "overview"},
+        {"label": "影响板块", "value": chain_sector or "未映射", "evidence": f"{chain_head.get('impact_type')} · {chain_head.get('impact_scope')}" if chain_head else "暂无消息映射证据", "confidence": news_confidence if chain_sector else "低", "edge_evidence": "按消息关键词、行业映射和直接/间接影响形成候选板块，不代表业绩已经兑现", "action": "sector", "target": chain_sector},
+        {"label": "资金验证", "value": fund_sector or "暂无承接方向", "evidence": f"板块5日净流 {fund_value:.2f}亿 · {fund_relation}" if fund_value is not None else "暂无数据", "confidence": "中" if fund_value is not None and fund_sector == chain_sector else "低", "edge_evidence": f"用{fund_sector or '对应板块'}5日主力净流验证消息映射；{fund_relation}", "action": "sector", "target": fund_sector},
+        {"label": "个股/ETF价格", "value": (chain_stock.get("name") if chain_stock is not None else chain_etf.get("name") if chain_etf else "暂无可映射标的"), "evidence": f"个股等权 {mean_ret:.2f}% · 上涨宽度 {breadth:.1f}%" if breadth is not None else "暂无价格证据", "confidence": "中" if chain_stock is not None and breadth is not None else "低", "edge_evidence": f"检查{chain_sector or '对应板块'}龙头/中军、上涨宽度和ETF是否与资金同向", "action": "stock" if chain_stock is not None else "overview", "target": chain_stock.get("ts_code") if chain_stock is not None else None},
+        {"label": "验证", "value": "价格与资金初步认可" if chain_head and chain_head.get("market_acceptance") == "价格与资金初步认可" else "尚不能确认因果", "evidence": "下一交易日复核板块资金、龙头/中军与ETF是否同步；时间相关性不等于因果", "confidence": "中" if chain_head and chain_head.get("market_acceptance") == "价格与资金初步认可" else "低", "edge_evidence": "价格、资金、上涨宽度和核心标的至少三项同向才提高置信度", "action": "overview"},
     ])
     overseas_conduction = []
     price_frame = pd.DataFrame(prices)

@@ -21,6 +21,12 @@ RULES = [
     ("涨价", 15, 14), ("政策支持", 20, 18), ("降息", 18, 20), ("并购", 22, 20),
     ("重组", 24, 22), ("分红", 12, 10), ("产能投产", 18, 17),
 ]
+DIRECTION_OVERRIDES = [
+    (r"终止.{0,8}减持|减持.{0,8}终止", 18, "终止减持计划"),
+    (r"(?:合同|项目|中标).{0,12}终止|终止.{0,12}(?:合同|项目|中标)", -35, "合同或项目终止"),
+    (r"未中标|流标|取消中标|解除合同", -30, "订单或合同落空"),
+    (r"立案|重大违法|退市|违约", -35, "重大风险事件"),
+]
 
 
 def score(row):
@@ -31,6 +37,13 @@ def score(row):
             hits.append(keyword)
             direction += direct
             event += value
+    # Status phrases take precedence over isolated positive nouns. For example,
+    # "中标项目合同终止" is a high-value negative event, not a positive tender.
+    for pattern, override, reason in DIRECTION_OVERRIDES:
+        if re.search(pattern, text):
+            direction = override
+            hits.append(reason)
+            break
     trust = SOURCE_TRUST.get(row.get("source"), 8)
     scope = 18 if re.search(r"行业|全国|政策|国务院|央行|证监会", text) else 10 if re.search(r"公司|项目|产品", text) else 7
     earnings = 18 if re.search(r"收入|利润|订单|价格|成本|产能|合同|中标|业绩", text) else 8
