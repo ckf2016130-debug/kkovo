@@ -334,7 +334,7 @@ def load_data():
                 estimated_total = component.groupby("ts_code")["basket_market_value"].transform("sum")
                 estimated_weight = component["basket_market_value"] / estimated_total * 100
                 component["weight"] = component["weight"].where(component["weight"].notna(), estimated_weight)
-            stock_lookup = stocks[[c for c in ["ts_code", "name", "industry"] if c in stocks.columns]].drop_duplicates("ts_code")
+            stock_lookup = stocks[[c for c in ["ts_code", "name", "industry", "week_ret"] if c in stocks.columns]].drop_duplicates("ts_code")
             component = component.merge(stock_lookup, left_on="con_code", right_on="ts_code", how="left", suffixes=("", "_stock"))
             exposure = []
             for code, group in component.groupby("ts_code", sort=False):
@@ -342,15 +342,21 @@ def load_data():
                 total = float(weights[weights > 0].sum()) if not weights.empty else None
                 ranked = group.sort_values("weight", ascending=False).dropna(subset=["weight"])
                 top10 = float(ranked.head(10)["weight"].sum()) if not ranked.empty else None
+                component_returns = pd.to_numeric(group.get("week_ret"), errors="coerce")
+                component_weights = pd.to_numeric(group.get("weight"), errors="coerce")
+                return_mask = component_returns.notna() & component_weights.notna() & (component_weights > 0)
+                return_weight = float(component_weights[return_mask].sum()) if return_mask.any() else 0
+                basket_week_ret = float((component_returns[return_mask] * component_weights[return_mask]).sum() / return_weight) if return_weight > 0 else None
+                basket_return_coverage = float(return_weight / total * 100) if total and return_weight > 0 else None
                 industry_exposure = []
                 if total and total > 0:
                     by_industry = ranked[ranked["industry"].notna()].groupby("industry")["weight"].sum().sort_values(ascending=False).head(5)
                     industry_exposure = [{"industry": str(k), "weight": round(float(v / total * 100), 2)} for k, v in by_industry.items()]
                 top_holdings = [{"name": str(row.get("con_name") or row.get("name") or row.get("name_stock") or row.get("con_code")), "code": str(row.get("con_code")), "weight": round(float(row["weight"]), 2)} for _, row in ranked.head(10).iterrows()]
                 basis = "PCF篮子数量×A股最新收盘价估算" if group["qty"].notna().any() else "接口直接提供权重"
-                exposure.append({"ts_code": code, "component_count": int(group["con_code"].nunique()), "top10_weight": round(top10, 2) if top10 is not None else None, "weight_coverage": round(total, 2) if total is not None else None, "component_weight_basis": basis, "industry_exposure": industry_exposure, "top_holdings": top_holdings})
+                exposure.append({"ts_code": code, "component_count": int(group["con_code"].nunique()), "top10_weight": round(top10, 2) if top10 is not None else None, "weight_coverage": round(total, 2) if total is not None else None, "component_weight_basis": basis, "basket_week_ret": round(basket_week_ret, 3) if basket_week_ret is not None else None, "basket_return_coverage": round(basket_return_coverage, 1) if basket_return_coverage is not None else None, "industry_exposure": industry_exposure, "top_holdings": top_holdings})
             etf_frame = pd.DataFrame(etfs).merge(pd.DataFrame(exposure), on="ts_code", how="left", suffixes=("", "_derived"))
-            for column in ["component_count", "top10_weight", "weight_coverage", "component_weight_basis", "industry_exposure", "top_holdings"]:
+            for column in ["component_count", "top10_weight", "weight_coverage", "component_weight_basis", "basket_week_ret", "basket_return_coverage", "industry_exposure", "top_holdings"]:
                 derived = f"{column}_derived"
                 if derived in etf_frame:
                     etf_frame[column] = etf_frame[derived].where(etf_frame[derived].notna(), etf_frame.get(column))
@@ -950,6 +956,8 @@ def build():
             latest_date, previous_date = dates_available[-1], dates_available[-2]
             latest = flow_frame[flow_frame["trade_date"].astype(str) == latest_date].set_index("industry")["net_mf_yi"]
             previous = flow_frame[flow_frame["trade_date"].astype(str) == previous_date].set_index("industry")["net_mf_yi"]
+            latest_rank = latest.rank(method="min", ascending=False)
+            previous_rank = previous.rank(method="min", ascending=False)
             for industry in set(latest.index) | set(previous.index):
                 before = float(previous.get(industry, 0) or 0)
                 after = float(latest.get(industry, 0) or 0)
@@ -965,6 +973,21 @@ def build():
                         "meaning": "关注回流是否由龙头和中军共同确认" if after > before else "警惕冲高兑现和板块内部扩散变弱",
                         "confidence": "中" if abs(after - before) >= 60 else "低",
                         "validation": "下一交易日观察资金方向与板块涨跌是否同步",
+                    })
+                old_rank = previous_rank.get(industry)
+                new_rank = latest_rank.get(industry)
+                if pd.notna(old_rank) and pd.notna(new_rank) and float(old_rank) - float(new_rank) >= 10:
+                    changes.append({
+                        "time": latest_date,
+                        "category": "板块资金排名快速上升",
+                        "title": f"{industry}资金排名由第{int(old_rank)}升至第{int(new_rank)}",
+                        "before": float(old_rank),
+                        "after": float(new_rank),
+                        "before_text": f"前一交易日第 {int(old_rank)} 名",
+                        "after_text": f"当前第 {int(new_rank)} 名",
+                        "meaning": "资金关注度短期明显提升，但排名改善不等于趋势已经形成，需检查价格、成交额和核心标的是否同步。",
+                        "confidence": "中" if after > 0 else "低",
+                        "validation": "下一交易日继续位于资金前列，且板块价格、上涨宽度、龙头和中军至少三项同向。",
                     })
             changes = sorted(changes, key=lambda x: abs(x["after"] - x["before"]), reverse=True)[:6]
         for date, group in flow_frame.groupby(flow_frame["trade_date"].astype(str), sort=True):
@@ -1080,6 +1103,80 @@ def build():
                     "confidence": "中" if sector_ret is not None and sector_flow is not None else "低",
                     "validation": "打开消息原文，并观察下一交易日板块、龙头/中军与对应ETF是否共同转强。",
                 })
+    news_history_path = ROOT / "data" / "news_validation_history.json"
+    try:
+        news_history = json.loads(news_history_path.read_text(encoding="utf-8")) if news_history_path.exists() else {}
+        news_history = news_history if isinstance(news_history, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        news_history = {}
+    validation_trade_date = max([str(x.get("trade_date")) for x in prices if x.get("trade_date")], default=latest_flow_date)
+    for brief in news_briefs:
+        event_key = f"{brief.get('time') or ''}|{brief.get('title') or ''}"
+        event_id = hashlib.sha1(event_key.encode("utf-8")).hexdigest()[:14]
+        industry = brief.get("industry")
+        sector_ret = daily_sector_returns.get(industry)
+        sector_flow = latest_sector_flow.get(industry)
+        linked_etf = next((item for item in etfs if item.get("name") == brief.get("affected_etf") or item.get("ts_code") == brief.get("affected_etf")), None)
+        validation_scope = industry
+        if brief.get("is_macro") is True or industry == "宏观政策":
+            valid_market_returns = [float(value) for value in daily_sector_returns.values() if value is not None]
+            sector_ret = sum(valid_market_returns) / len(valid_market_returns) if valid_market_returns else None
+            sector_flow = sum(float(value) for value in latest_sector_flow.values()) if latest_sector_flow else None
+            linked_etf = linked_etf or next((item for item in etfs if item.get("tool_role") == "宽基工具"), None)
+            validation_scope = "市场等权与宽基ETF"
+        direction = brief.get("direction")
+        if direction == "偏利好" and sector_ret is not None and sector_flow is not None:
+            validation_status = "价格与资金初步认可" if sector_ret > 0 and sector_flow > 0 else "利好未获共同认可" if sector_ret <= 0 or sector_flow < 0 else "待验证"
+        elif direction == "偏利空" and sector_ret is not None and sector_flow is not None:
+            validation_status = "利空已正常传导" if sector_ret < 0 and sector_flow < 0 else "利空被吸收/尚未传导" if sector_ret >= 0 else "待验证"
+        else:
+            validation_status = "证据不足，继续观察"
+        observation = {
+            "trade_date": validation_trade_date,
+            "industry": industry,
+            "scope": validation_scope,
+            "sector_ret": round(float(sector_ret), 3) if sector_ret is not None else None,
+            "sector_flow": round(float(sector_flow), 3) if sector_flow is not None else None,
+            "etf": linked_etf.get("name") if linked_etf else None,
+            "etf_ret": linked_etf.get("week_ret") if linked_etf else None,
+            "etf_premium": linked_etf.get("premium_discount") if linked_etf else None,
+            "status": validation_status,
+            "confidence": "中" if sector_ret is not None and sector_flow is not None else "低",
+        }
+        record = news_history.get(event_id, {"id": event_id, "title": brief.get("title"), "time": brief.get("time"), "observations": []})
+        observations = record.get("observations") if isinstance(record.get("observations"), list) else []
+        observations = [item for item in observations if str(item.get("trade_date")) != str(validation_trade_date)]
+        observations.append(observation)
+        record.update({"title": brief.get("title"), "time": brief.get("time"), "last_status": validation_status, "observations": observations[-20:]})
+        news_history[event_id] = record
+        brief.update({"event_id": event_id, "validation_status": validation_status, "validation_history": observations[-10:]})
+    try:
+        ordered_news_history = dict(sorted(news_history.items(), key=lambda item: str(item[1].get("time") or ""), reverse=True)[:300])
+        news_history_path.write_text(json.dumps(ordered_news_history, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    for etf in etfs:
+        etf_return = etf.get("week_ret")
+        basket_return = etf.get("basket_week_ret")
+        coverage = float(etf.get("basket_return_coverage") or 0)
+        if etf.get("return_reliable") is False or etf_return is None or basket_return is None or coverage < 60:
+            continue
+        divergence = float(etf_return) - float(basket_return)
+        etf["component_divergence"] = round(divergence, 3)
+        if abs(divergence) < 1.5:
+            continue
+        changes.append({
+            "time": etf.get("trade_date") or latest_flow_date,
+            "category": "ETF与成分股背离",
+            "title": f"{etf.get('name') or etf.get('ts_code')}与A股篮子收益背离",
+            "before": float(basket_return),
+            "after": float(etf_return),
+            "before_text": f"A股篮子估算 {float(basket_return):+.2f}%",
+            "after_text": f"ETF复权收益 {float(etf_return):+.2f}%",
+            "meaning": "ETF价格与可计算A股篮子表现不同步，可能来自海外/港股成分、现金替代、净值时差、申赎供需或跟踪误差，不能直接解释为套利空间。",
+            "confidence": "中" if coverage >= 80 else "低",
+            "validation": f"成分收益权重覆盖 {coverage:.1f}%；核对净值日期、溢折价、非A股成分和下一交易日价差是否收敛。",
+        })
     changes = sorted(changes, key=lambda x: abs(float(x.get("after") or 0) - float(x.get("before") or 0)), reverse=True)[:12]
     change_history_path = ROOT / "data" / "change_history.json"
     try:
@@ -1319,7 +1416,18 @@ if(changesHost&&!document.querySelector('#changeModeSwitch')){const sw=document.
 const enhanceEtfEvidence=()=>{const panel=document.querySelector('#etfSelectedEvidence');if(!panel||panel.querySelector('.etf-data-basis'))return;const selected=[...document.querySelectorAll('#etfBoard tbody tr')].findIndex(row=>row.classList.contains('etf-selected-row')),x=etfs[selected>=0?selected:0];if(!x)return;panel.insertAdjacentHTML('beforeend',`<div class="source etf-data-basis"><b>数据口径</b>：窗口收益=${escHtml(x.return_basis||'未复权收盘价')}；成分权重=${escHtml(x.component_weight_basis||'接口未提供可计算权重')}；净值日=${escHtml(x.nav_date||'未提供')}；复权因子 ${fmt(x.start_adj_factor,4)} → ${fmt(x.latest_adj_factor,4)}。</div>`)};document.querySelector('#etfBoard')?.addEventListener('click',()=>setTimeout(enhanceEtfEvidence,0));setTimeout(enhanceEtfEvidence,0);
 const conceptStyle=document.createElement('style');conceptStyle.textContent='.concept-panel{height:390px;margin-bottom:7px}.concept-layout{display:grid;grid-template-columns:1.35fr .85fr;height:calc(100% - 39px)}.concept-detail{padding:10px;border-left:1px solid var(--line);overflow:auto}.concept-title b,.concept-title small{display:block}.concept-title b{color:var(--gold);font-size:15px}.concept-title small,.concept-lead{color:var(--muted);margin-top:4px}.concept-kpis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;margin:8px 0}.concept-kpis span{padding:6px;background:var(--panel2);color:var(--muted);font-size:10px}.concept-kpis b{display:block;font-size:13px}.concept-members{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;margin:8px 0}.concept-members button{display:flex;justify-content:space-between;gap:5px;border:1px solid var(--line);background:var(--panel2);color:var(--text);padding:6px;text-align:left;cursor:pointer}.change-mode-switch{display:flex;gap:5px;padding:7px 9px;border-bottom:1px solid var(--line)}.etf-data-basis b{color:var(--gold)}@media(max-width:900px){.concept-panel{height:auto}.concept-layout{grid-template-columns:1fr;height:auto}.concept-layout>.chart{height:320px}.concept-detail{border-left:0;border-top:1px solid var(--line)}}';document.head.appendChild(conceptStyle);
 '''
-    trade_plan_ui += concept_change_ui
+    news_validation_ui = r'''
+const newsValidationRows=summary.news_briefs||[],newsValidationView=document.querySelector('#newsView');
+if(newsValidationView&&!document.querySelector('#newsValidationPanel')){
+  const panel=document.createElement('section');panel.id='newsValidationPanel';panel.className='panel news-validation-panel';panel.innerHTML='<div class="head">消息与价格资金验证 <small>事件时间只作对齐，时间相关性不等于因果</small></div><div class="news-validation-layout"><div id="newsValidationChart" class="chart"></div><div id="newsValidationEvidence" class="news-validation-evidence"></div></div>';
+  newsValidationView.appendChild(panel);const chart=echarts.init(panel.querySelector('#newsValidationChart'));charts.newsValidationChart=chart;let activeNewsValidationIndex=0;
+  const renderNewsValidation=index=>{activeNewsValidationIndex=index;const x=newsValidationRows[index]||newsValidationRows[0];if(!x){panel.querySelector('#newsValidationEvidence').innerHTML='<div class="empty">暂无可验证消息</div>';return}const sector=sectors.find(v=>v.industry===x.industry),scopeName=x.is_macro?'市场等权':'板块',priceRows=sector?.price_series||(x.is_macro?summary.market_price_series||[]:[]),flowRows=sector?flows.filter(v=>v.industry===x.industry):(x.is_macro?summary.market_flow_series||[]:[]),dates=[...new Set([...priceRows.map(v=>String(v[0])),...flowRows.map(v=>String(v.trade_date))])].sort(),priceLookup=Object.fromEntries(priceRows.map(v=>[String(v[0]),Number(v[1])])),flowLookup=Object.fromEntries(flowRows.map(v=>[String(v.trade_date),Number(v.net_mf_yi)])),first=dates.map(d=>priceLookup[d]).find(Number.isFinite),priceLine=dates.map(d=>Number.isFinite(priceLookup[d])&&Number.isFinite(first)?priceLookup[d]/first*100:null),eventDate=String(x.time||'').replace(/\D/g,'').slice(0,8),eventShort=eventDate?shortDate(eventDate):null,priceLabel=scopeName+'相对价格',flowLabel=scopeName+'主力净流';chart.setOption({animation:false,tooltip:{...tooltip,trigger:'axis'},legend:{type:'scroll',top:2,left:50,data:[priceLabel,flowLabel],textStyle:{color:C.muted}},grid:{left:58,right:58,top:46,bottom:34},xAxis:{type:'category',data:dates.map(shortDate),axisLabel:{color:C.muted}},yAxis:[{name:'起点=100',axisLabel:{color:C.muted},splitLine:{lineStyle:{color:'#24303a'}}},{name:'亿元',axisLabel:{color:C.muted}}],series:[{name:priceLabel,type:'line',showSymbol:false,data:priceLine,lineStyle:{color:C.gold,width:2},markLine:eventShort?{silent:true,symbol:['none','none'],label:{formatter:'消息',color:C.gold},lineStyle:{color:C.gold,type:'dashed'},data:[{xAxis:eventShort}]}:undefined},{name:flowLabel,type:'bar',yAxisIndex:1,data:dates.map(d=>flowLookup[d]??null),itemStyle:{color:p=>Number(p.value)>=0?C.up:C.down}}]},true);const history=x.validation_history||[];panel.querySelector('#newsValidationEvidence').innerHTML=`<div class="news-validation-title"><b>${escHtml(x.title||'未知消息')}</b><small>${escHtml(x.time||'时间未知')} · ${escHtml(x.industry||'未映射板块')} · ${escHtml(x.direction||'中性')}</small></div><div class="news-validation-status">当前判断：<b>${escHtml(x.validation_status||'待验证')}</b><small>影响价值 ${fmt(x.value_score,0)} · 可信度 ${fmt(x.trust_score,0)}</small></div><div class="news-validation-history">${history.slice().reverse().map(v=>`<div><b>${escHtml(v.trade_date||'未知日期')}</b><span>${escHtml(v.scope||scopeName)} ${fmt(v.sector_ret)}% · 资金 ${fmt(v.sector_flow)}亿</span><span>ETF ${escHtml(v.etf||'未映射')} · 溢折价 ${fmt(v.etf_premium)}%</span><em>${escHtml(v.status||'待验证')} · 置信度 ${escHtml(v.confidence||'低')}</em></div>`).join('')||'<small>当前为第一份验证记录，下一交易日后形成历史。</small>'}</div><small class="source">验证只比较消息映射对象与后续真实价格/资金，不证明消息是唯一原因。下一步验证：${escHtml(x.validation||'观察板块、龙头、中军和ETF是否同步')}。</small>`};
+  window.renderNewsValidation=renderNewsValidation;document.querySelector('#impactNewsSwitcher')?.addEventListener('click',event=>{const button=event.target.closest('[data-impact-index]');if(button&&button.dataset.impactIndex!=='all')renderNewsValidation(Number(button.dataset.impactIndex))});renderNewsValidation(0);
+  chartEvidenceRegistry.newsValidationChart={title:'消息与价格资金验证',definition:'把所选消息时间与映射板块的相对价格、主力净流及逐日验证状态放在同一时间轴上。',source:'真实消息快照、TinyShare板块成分日线与moneyflow资金快照',formula:'板块相对价格=板块价格序列/窗口首个有效值×100；板块资金=成分股主力净流合计。',unit:'相对价格点；资金：亿元',confidence:'中',raw:()=>({message:newsValidationRows[activeNewsValidationIndex],history:newsValidationRows[activeNewsValidationIndex]?.validation_history||[]})};mountChartEvidenceButtons();
+}
+const newsValidationStyle=document.createElement('style');newsValidationStyle.textContent='.news-validation-panel{height:390px;margin-top:7px}.news-validation-layout{display:grid;grid-template-columns:1.45fr .75fr;height:calc(100% - 39px)}.news-validation-evidence{padding:9px;border-left:1px solid var(--line);overflow:auto}.news-validation-title b,.news-validation-title small,.news-validation-status b,.news-validation-status small{display:block}.news-validation-title b{color:var(--text);line-height:1.45}.news-validation-title small,.news-validation-status small{color:var(--muted);margin-top:4px}.news-validation-status{padding:8px;background:var(--panel2);margin:8px 0}.news-validation-status b{color:var(--gold);font-size:14px}.news-validation-history>div{display:grid;grid-template-columns:70px 1fr;padding:6px 0;border-bottom:1px solid var(--line2);font-size:10px}.news-validation-history span,.news-validation-history em{color:var(--muted);font-style:normal}.news-validation-history em{grid-column:2}@media(max-width:900px){.news-validation-panel{height:auto}.news-validation-layout{grid-template-columns:1fr;height:auto}.news-validation-layout>.chart{height:300px}.news-validation-evidence{border-left:0;border-top:1px solid var(--line)}}';document.head.appendChild(newsValidationStyle);
+'''
+    trade_plan_ui += concept_change_ui + news_validation_ui
     template = template.replace('</script></body></html>', trade_plan_ui + '</script></body></html>')
     OUT.mkdir(parents=True, exist_ok=True)
     history_out = OUT / "history"
