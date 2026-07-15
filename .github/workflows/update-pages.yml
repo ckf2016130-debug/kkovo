@@ -19,7 +19,7 @@ permissions:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     environment:
       name: github-pages
 
@@ -46,6 +46,11 @@ jobs:
         env:
           TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
         run: timeout 240s python fetch_tinyshare_week.py || echo "Market source timeout or authorization lock; previous snapshot will be used"
+
+      - name: Fetch concept and ETF intelligence
+        env:
+          TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
+        run: timeout 240s python fetch_tinyshare_intelligence.py || echo "Concept or ETF intelligence timeout/permission failure; available snapshots will be used"
 
       - name: Ensure K-line history window
         env:

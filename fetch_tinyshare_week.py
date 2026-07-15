@@ -163,13 +163,7 @@ def main():
         if trade_date in dates:
             manifest.append(fetch(pro, "fund_daily", f"etf_daily_{trade_date}.csv", trade_date=trade_date))
             manifest.append(fetch(pro, "fund_share", f"fund_share_{trade_date}.csv", trade_date=trade_date))
-            manifest.append(fetch(pro, "fund_adj", f"fund_adj_{trade_date}.csv", trade_date=trade_date))
-            if trade_date == dates[-1]:
-                manifest.append(fetch(pro, "fund_nav", f"fund_nav_{trade_date}.csv", nav_date=trade_date, market="E"))
             time.sleep(0.25)
-
-    manifest.extend(fetch_active_concepts(pro, dates[-1], history_dates[0], history_dates[-1]))
-    manifest.append(fetch_focus_etf_components(pro, dates[-1]))
 
     for api_name, filename, kwargs in [
         ("index_classify", "sw_index_classify.csv", {"level": "L1", "src": "SW2021"}),
