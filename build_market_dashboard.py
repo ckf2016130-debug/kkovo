@@ -385,11 +385,19 @@ def build():
         stocks_frame[col] = pd.to_numeric(stocks_frame.get(col), errors="coerce")
     cap_mid = stocks_frame["circ_mv_yi"].median()
     turn_mid = stocks_frame["turnover_rate"].median()
+    cap_q75 = stocks_frame["circ_mv_yi"].quantile(0.75)
+    turn_q75 = stocks_frame["turnover_rate"].quantile(0.75)
+    # The four groups are behavior proxies, not account ownership. Keep the
+    # stock universes disjoint so the same net flow is not counted repeatedly.
+    state_mask = stocks_frame["circ_mv_yi"] >= cap_q75
+    hot_mask = (~state_mask) & (stocks_frame["turnover_rate"] >= turn_q75) & (stocks_frame["U"].fillna(0) + stocks_frame["Z"].fillna(0) > 0)
+    institution_mask = (~state_mask) & (~hot_mask) & (stocks_frame["circ_mv_yi"] >= cap_mid) & (stocks_frame["turnover_rate"] <= turn_mid)
+    retail_mask = ~(state_mask | hot_mask | institution_mask)
     proxy_specs = [
-        ("国家队代理", stocks_frame["circ_mv_yi"] >= cap_mid, "大市值与权重股的资金方向"),
-        ("机构代理", (stocks_frame["circ_mv_yi"] >= cap_mid) & (stocks_frame["turnover_rate"] <= turn_mid), "大市值、低换手、持续交易方向"),
-        ("游资代理", (stocks_frame["U"].fillna(0) + stocks_frame["Z"].fillna(0) > 0) & (stocks_frame["turnover_rate"] >= turn_mid), "涨停/炸板与高换手行为"),
-        ("散户代理", (stocks_frame["circ_mv_yi"] < cap_mid) & (stocks_frame["turnover_rate"] >= turn_mid), "小市值与高换手行为"),
+        ("国家队代理", state_mask, "流通市值前25%权重股的超大单/主力方向"),
+        ("机构代理", institution_mask, "非权重样本中大市值、低换手股票的大单/主力方向"),
+        ("游资代理", hot_mask, "非权重样本中涨停/炸板且高换手股票的大单方向"),
+        ("散户代理", retail_mask, "其余股票的小单与中单方向；仅作行为代理"),
     ]
     proxy_funds = []
     for name, mask, basis in proxy_specs:
@@ -407,29 +415,35 @@ def build():
     sector_agent_series = {}
     stock_agent_series = {}
     stock_class = stocks_frame[["ts_code", "industry", "circ_mv_yi", "turnover_rate", "U", "Z"]].copy()
-    cap_mid = stocks_frame["circ_mv_yi"].median()
-    turn_mid = stocks_frame["turnover_rate"].median()
     for path in sorted((ROOT / "data").glob("moneyflow_*.csv")):
         try:
             mf = pd.read_csv(path)
             mf["net_mf_amount"] = pd.to_numeric(mf["net_mf_amount"], errors="coerce")
             merged = mf.merge(stock_class, on="ts_code", how="inner").dropna(subset=["net_mf_amount"])
-            net = merged["net_mf_amount"]
+            for col in ["buy_sm_amount", "sell_sm_amount", "buy_md_amount", "sell_md_amount", "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount"]:
+                merged[col] = pd.to_numeric(merged.get(col), errors="coerce").fillna(0)
+            merged["small_mid_net"] = merged["buy_sm_amount"] - merged["sell_sm_amount"] + merged["buy_md_amount"] - merged["sell_md_amount"]
+            merged["large_net"] = merged["buy_lg_amount"] - merged["sell_lg_amount"]
+            merged["extra_large_net"] = merged["buy_elg_amount"] - merged["sell_elg_amount"]
+            state_day = merged["circ_mv_yi"] >= cap_q75
+            hot_day = (~state_day) & (merged["turnover_rate"] >= turn_q75) & (merged["U"].fillna(0) + merged["Z"].fillna(0) > 0)
+            institution_day = (~state_day) & (~hot_day) & (merged["circ_mv_yi"] >= cap_mid) & (merged["turnover_rate"] <= turn_mid)
+            retail_day = ~(state_day | hot_day | institution_day)
             masks = {
-                "国家队代理": merged["circ_mv_yi"] >= cap_mid,
-                "机构代理": (merged["circ_mv_yi"] >= cap_mid) & (merged["turnover_rate"] <= turn_mid),
-                "游资代理": (merged["U"].fillna(0) + merged["Z"].fillna(0) > 0) & (merged["turnover_rate"] >= turn_mid),
-                "散户代理": (merged["circ_mv_yi"] < cap_mid) & (merged["turnover_rate"] >= turn_mid),
+                "国家队代理": (state_day, "extra_large_net"),
+                "机构代理": (institution_day, "extra_large_net"),
+                "游资代理": (hot_day, "large_net"),
+                "散户代理": (retail_day, "small_mid_net"),
             }
             date = str(mf["trade_date"].iloc[0]) if not mf.empty else path.stem.split("_")[-1]
-            for name, mask in masks.items():
-                value = float(net.loc[mask].sum()) / 100000 if mask.any() else None
+            for name, (mask, value_col) in masks.items():
+                value = float(merged.loc[mask, value_col].sum()) / 100000 if mask.any() else None
                 agent_series.append({"trade_date": date, "name": name, "value": round(value, 2) if value is not None else None})
                 if mask.any():
-                    grouped = merged.loc[mask].groupby("industry")["net_mf_amount"].sum() / 100000
+                    grouped = merged.loc[mask].groupby("industry")[value_col].sum() / 100000
                     for industry, sector_value in grouped.items():
                         sector_agent_series.setdefault(str(industry), []).append({"trade_date": date, "name": name, "value": round(float(sector_value), 2)})
-                    stock_grouped = merged.loc[mask].groupby("ts_code")["net_mf_amount"].sum() / 100000
+                    stock_grouped = merged.loc[mask].groupby("ts_code")[value_col].sum() / 100000
                     for code, stock_value in stock_grouped.items():
                         stock_agent_series.setdefault(str(code), []).append({"trade_date": date, "name": name, "value": round(float(stock_value), 2)})
         except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
@@ -438,6 +452,33 @@ def build():
         sector["agent_series"] = sector_agent_series.get(str(sector.get("industry")), [])
     for stock in stocks:
         stock["agent_series"] = stock_agent_series.get(str(stock.get("ts_code")), [])
+    proxy_basis = {name: basis for name, _, basis in proxy_specs}
+    for proxy in proxy_funds:
+        values = [row.get("value") for row in agent_series if row.get("name") == proxy.get("name") and row.get("value") is not None]
+        value = float(sum(values)) if values else None
+        proxy.update({
+            "value": round(value, 2) if value is not None else None,
+            "direction": "净流入" if value is not None and value > 0 else "净流出" if value is not None and value < 0 else "暂无数据",
+            "basis": proxy_basis.get(proxy.get("name"), proxy.get("basis")),
+            "window": f"最近{len(values)}个可用交易日",
+        })
+    for sector in sectors:
+        rows = sector.get("agent_series", [])
+        coverage_map = {row.get("name"): row.get("coverage") for row in sector.get("agent_flows", [])}
+        rebuilt = []
+        for name in proxy_basis:
+            values = [row.get("value") for row in rows if row.get("name") == name and row.get("value") is not None]
+            value = float(sum(values)) if values else None
+            rebuilt.append({
+                "name": name,
+                "value": round(value, 2) if value is not None else None,
+                "direction": "净流入" if value is not None and value > 0 else "净流出" if value is not None and value < 0 else "暂无数据",
+                "coverage": coverage_map.get(name, 0),
+                "basis": proxy_basis[name],
+                "window": f"最近{len(values)}个可用交易日",
+            })
+        sector["agent_flows"] = rebuilt
+    market_price_series = []
     price_frame = pd.DataFrame(prices)
     if not price_frame.empty:
         price_frame["trade_date"] = price_frame["trade_date"].astype(str)
@@ -448,12 +489,36 @@ def build():
         industry_lookup = stocks_frame[["ts_code", "industry"]].drop_duplicates("ts_code")
         sector_prices = price_frame.merge(industry_lookup, on="ts_code", how="left").dropna(subset=["industry", "close"])
         sector_prices = sector_prices.groupby(["industry", "trade_date"], as_index=False)["close"].median()
+        market_returns = price_frame.sort_values(["ts_code", "trade_date"]).copy()
+        market_returns["daily_ret"] = market_returns.groupby("ts_code")["close"].pct_change()
+        market_returns = market_returns.groupby("trade_date")["daily_ret"].mean().dropna().sort_index()
+        market_index = (1 + market_returns).cumprod() * 100
+        market_price_series = [[str(date), round(float(value), 4)] for date, value in market_index.items()]
         sector_price_map = {
             str(industry): [[str(row.trade_date), round(float(row.close), 4)] for row in group.itertuples()]
             for industry, group in sector_prices.sort_values("trade_date").groupby("industry", sort=False)
         }
+        price_by_code = {
+            str(code): [[str(row.trade_date), round(float(row.close), 4)] for row in group.sort_values("trade_date").itertuples()]
+            for code, group in price_frame.dropna(subset=["ts_code", "close"]).groupby("ts_code", sort=False)
+        }
+        leader_by_industry = {}
+        for industry, group in stocks_frame.groupby("industry", sort=False):
+            ranked = group.sort_values(["leader_score", "core_score"], ascending=False)
+            if not ranked.empty:
+                row = ranked.iloc[0]
+                leader_by_industry[str(industry)] = {"code": str(row.get("ts_code")), "name": row.get("name")}
         for sector in sectors:
-            sector["price_series"] = sector_price_map.get(str(sector.get("industry")), [])
+            industry = str(sector.get("industry"))
+            sector["price_series"] = sector_price_map.get(industry, [])
+            leader = leader_by_industry.get(industry, {})
+            sector["leader_code"] = leader.get("code")
+            sector["leader_name"] = leader.get("name")
+            sector["leader_price_series"] = price_by_code.get(leader.get("code"), [])
+        for stock in stocks:
+            leader = leader_by_industry.get(str(stock.get("industry")), {})
+            stock["industry_leader_code"] = leader.get("code")
+            stock["industry_leader_name"] = leader.get("name")
     flow_values = pd.to_numeric(pd.Series([x.get("net_mf_yi") for x in sectors]), errors="coerce")
     flow_rank = flow_values.rank(pct=True).fillna(0.5) * 100
     for sector, rank in zip(sectors, flow_rank.tolist()):
@@ -651,6 +716,93 @@ def build():
         overseas_conduction.append({"asset": asset, "group": item.get("group"), "ret_5d": ret5, "ret_20d": item.get("ret_20d"), "ret_60d": item.get("ret_60d"), "targets": [s.get("industry") for s in targets[:5]], "target_ret": target_ret, "same_corr_60": same_corr, "lead_corr_60": lead_corr, "state": state, "confidence": "中" if targets and same_corr is not None else "低"})
     for row in overseas_conduction:
         row.update(corr_by_asset.get(row.get("asset"), {}))
+    high_low_switch = {
+        "available": False,
+        "definition": "每日先用此前5个交易日板块等权收益排序，前25%为高位组、后25%为低位组；再观察当日收益和资金，不使用当日数据分组。",
+        "series": [],
+        "windows": [],
+    }
+    if not price_frame.empty and {"ts_code", "trade_date", "pct_chg"}.issubset(price_frame.columns):
+        switch_prices = price_frame[["ts_code", "trade_date", "pct_chg"]].copy()
+        switch_prices["trade_date"] = switch_prices["trade_date"].astype(str)
+        switch_prices["pct_chg"] = pd.to_numeric(switch_prices["pct_chg"], errors="coerce")
+        switch_prices = switch_prices.merge(stocks_frame[["ts_code", "industry"]].drop_duplicates("ts_code"), on="ts_code", how="left")
+        sector_return = switch_prices.dropna(subset=["industry", "pct_chg"]).groupby(["trade_date", "industry"])["pct_chg"].mean().unstack()
+        switch_flow = pd.DataFrame(flows)
+        if not switch_flow.empty:
+            switch_flow["trade_date"] = switch_flow["trade_date"].astype(str)
+            switch_flow["net_mf_yi"] = pd.to_numeric(switch_flow["net_mf_yi"], errors="coerce")
+            sector_flow_pivot = switch_flow.pivot_table(index="trade_date", columns="industry", values="net_mf_yi", aggfunc="sum")
+        else:
+            sector_flow_pivot = pd.DataFrame()
+        switch_rows = []
+        latest_high = []
+        latest_low = []
+        sector_return = sector_return.sort_index()
+        for pos in range(5, len(sector_return)):
+            date = str(sector_return.index[pos])
+            prior_momentum = sector_return.iloc[pos - 5:pos].sum(min_count=3).dropna().sort_values()
+            if len(prior_momentum) < 8:
+                continue
+            group_size = max(2, len(prior_momentum) // 4)
+            low_names = prior_momentum.head(group_size).index.tolist()
+            high_names = prior_momentum.tail(group_size).index.tolist()
+            current_ret = sector_return.iloc[pos]
+            high_ret = pd.to_numeric(current_ret.reindex(high_names), errors="coerce").mean()
+            low_ret = pd.to_numeric(current_ret.reindex(low_names), errors="coerce").mean()
+            flow_row = sector_flow_pivot.loc[date] if date in sector_flow_pivot.index else pd.Series(dtype=float)
+            high_flow = pd.to_numeric(flow_row.reindex(high_names), errors="coerce").sum(min_count=1)
+            low_flow = pd.to_numeric(flow_row.reindex(low_names), errors="coerce").sum(min_count=1)
+            switch_rows.append({
+                "trade_date": date,
+                "high_ret": round(float(high_ret), 4) if pd.notna(high_ret) else None,
+                "low_ret": round(float(low_ret), 4) if pd.notna(low_ret) else None,
+                "ret_spread": round(float(low_ret - high_ret), 4) if pd.notna(high_ret) and pd.notna(low_ret) else None,
+                "high_flow": round(float(high_flow), 2) if pd.notna(high_flow) else None,
+                "low_flow": round(float(low_flow), 2) if pd.notna(low_flow) else None,
+            })
+            latest_high, latest_low = high_names, low_names
+        switch_frame = pd.DataFrame(switch_rows)
+        if not switch_frame.empty:
+            def safe_corr(left, right):
+                pair = pd.concat([left, right], axis=1).dropna()
+                return float(pair.iloc[:, 0].corr(pair.iloc[:, 1])) if len(pair) >= 5 and pair.iloc[:, 0].nunique() > 1 and pair.iloc[:, 1].nunique() > 1 else None
+            windows = []
+            for window in (5, 20, 60):
+                part = switch_frame.tail(window)
+                enough = len(part) >= window
+                windows.append({
+                    "window": window,
+                    "available": enough,
+                    "samples": int(len(part)),
+                    "return_corr": round(safe_corr(part["high_ret"], part["low_ret"]), 3) if enough and safe_corr(part["high_ret"], part["low_ret"]) is not None else None,
+                    "fund_corr": round(safe_corr(part["high_flow"], part["low_flow"]), 3) if enough and safe_corr(part["high_flow"], part["low_flow"]) is not None else None,
+                    "high_leads_low": round(safe_corr(part["high_ret"].shift(1), part["low_ret"]), 3) if enough and safe_corr(part["high_ret"].shift(1), part["low_ret"]) is not None else None,
+                    "low_leads_high": round(safe_corr(part["low_ret"].shift(1), part["high_ret"]), 3) if enough and safe_corr(part["low_ret"].shift(1), part["high_ret"]) is not None else None,
+                })
+            signs = switch_frame["ret_spread"].dropna().map(lambda value: 1 if value > 0 else -1 if value < 0 else 0).tolist()
+            duration = 0
+            if signs and signs[-1] != 0:
+                for sign in reversed(signs):
+                    if sign == signs[-1]:
+                        duration += 1
+                    else:
+                        break
+            latest = switch_rows[-1]
+            state = "低位组占优" if (latest.get("ret_spread") or 0) > 0 else "高位组占优" if (latest.get("ret_spread") or 0) < 0 else "高低位均衡"
+            high_low_switch = {
+                "available": True,
+                "definition": high_low_switch["definition"],
+                "series": switch_rows,
+                "windows": windows,
+                "state": state,
+                "duration": duration,
+                "latest_date": latest.get("trade_date"),
+                "high_group": latest_high,
+                "low_group": latest_low,
+                "confidence": "中" if len(switch_rows) >= 20 else "低",
+                "validation": "下一交易日继续用前一日已知分组，检查收益差和资金差是否同向延续；相关性不代表资金逐笔迁移。",
+            }
     flow_frame = pd.DataFrame(flows)
     market_flow_series = []
     rotation_timeline = []
@@ -668,9 +820,12 @@ def build():
                 if (before < 0 <= after) or (before > 0 >= after) or abs(after - before) >= 30:
                     changes.append({
                         "time": latest_date,
+                        "category": "资金方向变化",
                         "title": f"{industry}资金由{'流出转为流入' if before < 0 <= after else '流入转为流出' if before > 0 >= after else '快速变化'}",
                         "before": round(before, 2),
                         "after": round(after, 2),
+                        "before_text": f"前日 {before:+.2f}亿",
+                        "after_text": f"当日 {after:+.2f}亿",
                         "meaning": "关注回流是否由龙头和中军共同确认" if after > before else "警惕冲高兑现和板块内部扩散变弱",
                         "confidence": "中" if abs(after - before) >= 60 else "低",
                         "validation": "下一交易日观察资金方向与板块涨跌是否同步",
@@ -700,6 +855,96 @@ def build():
         daily_sector_returns = latest_prices.dropna(subset=["industry", "pct_chg"]).groupby("industry")["pct_chg"].mean().round(3).to_dict()
     latest_flow_date = max([str(x.get("trade_date")) for x in flows], default="")
     latest_sector_flow = {str(x.get("industry")): float(x.get("net_mf_yi") or 0) for x in flows if str(x.get("trade_date")) == latest_flow_date}
+    if not price_review.empty and {"trade_date", "ts_code", "pct_chg"}.issubset(price_review.columns):
+        latest_price_date = str(price_review["trade_date"].astype(str).max())
+        latest_snapshot = price_review[price_review["trade_date"].astype(str) == latest_price_date].copy()
+        latest_snapshot["pct_chg"] = pd.to_numeric(latest_snapshot["pct_chg"], errors="coerce")
+        latest_snapshot = latest_snapshot.merge(stocks_frame[["ts_code", "industry"]].drop_duplicates("ts_code"), on="ts_code", how="left")
+        latest_breadth = float((latest_snapshot["pct_chg"].dropna() > 0).mean() * 100) if latest_snapshot["pct_chg"].notna().any() else None
+        if index_day_ret is not None and latest_breadth is not None and ((index_day_ret > 0.5 and latest_breadth < 45) or (index_day_ret < -0.5 and latest_breadth > 55)):
+            changes.append({
+                "time": latest_price_date,
+                "category": "指数与个股背离",
+                "title": "代表指数与个股上涨宽度方向背离",
+                "before": index_day_ret,
+                "after": latest_breadth,
+                "before_text": f"指数 {index_day_ret:+.2f}%",
+                "after_text": f"上涨宽度 {latest_breadth:.1f}%",
+                "meaning": "指数上涨但多数个股未跟随时偏权重护盘；指数下跌而多数个股上涨时说明局部风险偏好更强。",
+                "confidence": "中",
+                "validation": "检查主要宽基指数、成交额和上涨中位数是否连续两个交易日保持背离。",
+            })
+        by_code_ret = latest_snapshot.set_index("ts_code")["pct_chg"]
+        for sector in sectors:
+            industry = str(sector.get("industry"))
+            sector_ret = daily_sector_returns.get(industry)
+            sector_flow = latest_sector_flow.get(industry)
+            if sector_ret is not None and sector_flow is not None and ((sector_ret >= 1 and sector_flow < 0) or (sector_ret <= -1 and sector_flow > 0)):
+                changes.append({
+                    "time": latest_price_date,
+                    "category": "价格与资金背离",
+                    "title": f"{industry}价格与资金方向相反",
+                    "before": sector_ret,
+                    "after": sector_flow,
+                    "before_text": f"板块 {sector_ret:+.2f}%",
+                    "after_text": f"资金 {sector_flow:+.2f}亿",
+                    "meaning": "上涨流出需警惕冲高兑现；下跌流入可能是承接，也可能是抄底尚未被价格确认。",
+                    "confidence": "中",
+                    "validation": "下一交易日观察价格与资金是否重新同向，并检查龙头和中军是否确认。",
+                })
+            leader_code = sector.get("leader_code")
+            leader_ret = by_code_ret.get(leader_code) if leader_code in by_code_ret.index else None
+            if sector_ret is not None and leader_ret is not None and pd.notna(leader_ret) and abs(float(leader_ret) - float(sector_ret)) >= 3:
+                changes.append({
+                    "time": latest_price_date,
+                    "category": "龙头与板块背离",
+                    "title": f"{industry}龙头与板块强弱背离",
+                    "before": float(leader_ret),
+                    "after": float(sector_ret),
+                    "before_text": f"{sector.get('leader_name') or '龙头候选'} {float(leader_ret):+.2f}%",
+                    "after_text": f"板块 {float(sector_ret):+.2f}%",
+                    "meaning": "龙头明显弱于板块可能表示核心地位松动；龙头独强则需警惕板块跟随不足。",
+                    "confidence": "中",
+                    "validation": "比较下一交易日龙头、中军和板块上涨宽度是否重新同步。",
+                })
+        if agent_series:
+            agent_latest_date = max(str(x.get("trade_date")) for x in agent_series)
+            agent_latest = {x.get("name"): x.get("value") for x in agent_series if str(x.get("trade_date")) == agent_latest_date}
+            institution = agent_latest.get("机构代理")
+            retail = agent_latest.get("散户代理")
+            if institution is not None and retail is not None and float(institution) * float(retail) < 0:
+                changes.append({
+                    "time": agent_latest_date,
+                    "category": "机构与散户方向相反",
+                    "title": "机构代理与散户代理方向相反",
+                    "before": float(institution),
+                    "after": float(retail),
+                    "before_text": f"机构代理 {float(institution):+.2f}亿",
+                    "after_text": f"散户代理 {float(retail):+.2f}亿",
+                    "meaning": "不同订单规模和股票特征的资金方向分化，说明市场参与者并未形成一致预期。",
+                    "confidence": "低",
+                    "validation": "连续观察至少三个交易日，并结合大市值/小市值相对收益确认；代理口径不等于真实账户。",
+                })
+        for brief in news_briefs:
+            industry = brief.get("industry")
+            if brief.get("direction") != "偏利好" or not industry or industry == "宏观政策":
+                continue
+            sector_ret = daily_sector_returns.get(industry)
+            sector_flow = latest_sector_flow.get(industry)
+            if (sector_ret is not None and sector_ret <= 0) or (sector_flow is not None and sector_flow < 0):
+                changes.append({
+                    "time": brief.get("time") or latest_price_date,
+                    "category": "利好与价格背离",
+                    "title": f"{industry}利好尚未获得价格和资金共同确认",
+                    "before": float(sector_ret) if sector_ret is not None else None,
+                    "after": float(sector_flow) if sector_flow is not None else None,
+                    "before_text": f"板块 {float(sector_ret):+.2f}%" if sector_ret is not None else "板块价格缺失",
+                    "after_text": f"资金 {float(sector_flow):+.2f}亿" if sector_flow is not None else "板块资金缺失",
+                    "meaning": "利好可能已提前交易、映射错误或不足以改变原有趋势，不能仅凭标题追涨。",
+                    "confidence": "中" if sector_ret is not None and sector_flow is not None else "低",
+                    "validation": "打开消息原文，并观察下一交易日板块、龙头/中军与对应ETF是否共同转强。",
+                })
+    changes = sorted(changes, key=lambda x: abs(float(x.get("after") or 0) - float(x.get("before") or 0)), reverse=True)[:12]
     summary = {
         "stock_count": len(stocks),
         "sector_count": len(sectors),
@@ -745,9 +990,11 @@ def build():
         "logic_chain": logic_chain,
         "market_flow_series": market_flow_series,
         "rotation_timeline": rotation_timeline,
+        "high_low_switch": high_low_switch,
+        "market_price_series": market_price_series,
         "changes": changes,
         "overseas_conduction": overseas_conduction,
-        "flow_periods": [{"period": "5分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "15分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "30分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "当日", "available": bool(market_flow_series), "reason": "按板块日级主力净流合计"}, {"period": "3日", "available": len(market_flow_series) >= 3, "reason": "按最近可用交易日合计"}, {"period": "5日", "available": len(market_flow_series) >= 5, "reason": "按最近可用交易日合计"}, {"period": "20日", "available": False, "reason": "当前快照不足20个交易日资金明细"}],
+        "flow_periods": [{"period": "5分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "15分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "30分钟", "available": False, "reason": "当前授权接口未提供分时资金明细"}, {"period": "当日", "available": bool(market_flow_series), "reason": "按板块日级主力净流合计"}, {"period": "3日", "available": len(market_flow_series) >= 3, "reason": "按最近可用交易日合计"}, {"period": "5日", "available": len(market_flow_series) >= 5, "reason": "按最近可用交易日合计"}, {"period": "20日", "available": len(market_flow_series) >= 20, "reason": "按最近20个可用交易日合计" if len(market_flow_series) >= 20 else f"当前仅有{len(market_flow_series)}个交易日资金明细"}],
         "proxy_funds": proxy_funds,
         "agent_series": agent_series,
         "proxy_links": proxy_links,
@@ -795,6 +1042,7 @@ def build():
     template = template.replace("slice(0,2)||'other'", "slice(0,4)||'other'")
     template = template.replace(".stock-side{padding:14px}", ".stock-side{padding:14px;height:calc(100% - 39px);overflow:auto}")
     template = template.replace("强势延续", "强势板块延续").replace("潜在轮入", "潜在轮动方向").replace("上涨分歧", "上涨但资金背离")
+    template = template.replace("${escHtml(x.basis||'')} · 覆盖 ${fmt(x.coverage,0)} 只", "${escHtml(x.basis||'')} · ${escHtml(x.window||'可用窗口')} · 覆盖 ${fmt(x.coverage,0)} 只")
     stock_history = {}
     for row in prices:
         code = str(row.get("ts_code") or "")
@@ -830,7 +1078,7 @@ def build():
     }
     for key, value in replacements.items():
         template = template.replace(key, value)
-    stock_agent_ui = r'''const stockAgentAnchor=document.querySelector('#stockView .stock-evidence');if(stockAgentAnchor&&!document.querySelector('#stockAgentChart')){const panel=document.createElement('section');panel.className='panel stock-agent-evidence';panel.innerHTML='<div class="head">个股四类代理资金 <small>按个股日级主力净流回算；估算，不代表账户归属</small></div><div id="stockAgentChart" class="chart"></div>';stockAgentAnchor.parentNode.insertBefore(panel,stockAgentAnchor.nextSibling);const chart=echarts.init(document.querySelector('#stockAgentChart'));const names=['国家队代理','机构代理','游资代理','散户代理'],colors=[C.gold,C.cyan,C.up,C.down];const render=()=>{const rows=selectedStock?.agent_series||[],dates=[...new Set(rows.map(x=>String(x.trade_date)))].sort();chart.setOption({animation:false,tooltip:{...tooltip,trigger:'axis'},legend:{data:names,textStyle:{color:C.muted}},grid:{left:58,right:18,top:35,bottom:32},xAxis:{type:'category',data:dates.map(shortDate),axisLabel:{color:C.muted}},yAxis:{name:'亿元',axisLabel:{color:C.muted},splitLine:{lineStyle:{color:'#24303a'}}},series:names.map((name,i)=>({name,type:'line',showSymbol:false,smooth:true,data:dates.map(d=>{const x=rows.find(v=>String(v.trade_date)===d&&v.name===name);return x?x.value:null}),lineStyle:{color:colors[i]},itemStyle:{color:colors[i]}}))},true)};const prior=renderStock;renderStock=function(){prior();render()};render()}const stockAgentStyle=document.createElement('style');stockAgentStyle.textContent='.stock-agent-evidence{height:300px;margin-top:7px}.stock-agent-evidence .chart{height:calc(100% - 39px)}';document.head.appendChild(stockAgentStyle)
+    stock_agent_ui = r'''const stockAgentAnchor=document.querySelector('#stockView .stock-evidence');if(stockAgentAnchor&&!document.querySelector('#stockAgentChart')){const panel=document.createElement('section');panel.className='panel stock-agent-evidence';panel.innerHTML='<div class="head">个股四类代理资金 <small>按订单规模与股票特征回算；估算，不代表账户归属</small></div><div id="stockAgentChart" class="chart"></div>';stockAgentAnchor.parentNode.insertBefore(panel,stockAgentAnchor.nextSibling);const chart=echarts.init(document.querySelector('#stockAgentChart'));const names=['国家队代理','机构代理','游资代理','散户代理'],colors=[C.gold,C.cyan,C.up,C.down];const render=()=>{const rows=selectedStock?.agent_series||[],dates=[...new Set(rows.map(x=>String(x.trade_date)))].sort();chart.setOption({animation:false,tooltip:{...tooltip,trigger:'axis'},legend:{data:names,textStyle:{color:C.muted}},grid:{left:58,right:18,top:35,bottom:32},xAxis:{type:'category',data:dates.map(shortDate),axisLabel:{color:C.muted}},yAxis:{name:'亿元',axisLabel:{color:C.muted},splitLine:{lineStyle:{color:'#24303a'}}},series:names.map((name,i)=>({name,type:'line',showSymbol:false,smooth:true,data:dates.map(d=>{const x=rows.find(v=>String(v.trade_date)===d&&v.name===name);return x?x.value:null}),lineStyle:{color:colors[i]},itemStyle:{color:colors[i]}}))},true)};const prior=renderStock;renderStock=function(){prior();render()};render()}const stockAgentStyle=document.createElement('style');stockAgentStyle.textContent='.stock-agent-evidence{height:300px;margin-top:7px}.stock-agent-evidence .chart{height:calc(100% - 39px)}';document.head.appendChild(stockAgentStyle)
 '''
     valuation_ui = r'''const priorValuationRange=typeof updateValuationRange==='function'?updateValuationRange:null;if(priorValuationRange){updateValuationRange=function(){priorValuationRange();const box=document.querySelector('#valuationOverview');if(!box)return;let note=box.querySelector('.valuation-assumption-note');if(!note){note=document.createElement('div');note.className='valuation-assumption-note source';box.appendChild(note)}const names=typeof valuationModels==='function'?valuationModels().map(x=>x.name).join('、'):'';note.textContent=`估值解释：仅使用真实正值输入形成 ${names||'暂无可用'} 模型；中性参考价、悲观和乐观边界分别取可用模型对应情景的中位数，不使用固定回退倍数，也不让单一极端模型直接决定区间。当前假设：PE ${document.querySelector('#vPeBase')?.value||'—'} 倍、PB ${document.querySelector('#vPbBase')?.value||'—'} 倍、FCFE增长 ${document.querySelector('#vGrowth')?.value||'—'}%、折现率 ${document.querySelector('#vDiscount')?.value||'—'}%、永续增长 ${document.querySelector('#vTerminal')?.value||'—'}%。财务覆盖率 ${fmt(selectedStock?.fundamental_coverage,0)}%；结果只作区间观察，不是目标价。`};updateValuationRange();document.querySelectorAll('.valuation-form input').forEach(i=>i.addEventListener('input',()=>setTimeout(updateValuationRange,0)))}const valuationStyle=document.createElement('style');valuationStyle.textContent='.valuation-assumption-note{grid-column:1/-1;padding:8px;background:var(--panel2);line-height:1.6}';document.head.appendChild(valuationStyle)
 '''
@@ -871,7 +1119,7 @@ if(tradePlanAnchor&&!document.querySelector('#tradePlanPanel')){
   panel.querySelectorAll('[data-plan-etf]').forEach(b=>b.onclick=()=>{showView('overviewView');document.querySelector('#etfBoard')?.scrollIntoView({behavior:'smooth',block:'center'})});
   const style=document.createElement('style');style.textContent='.trade-plan-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:7px;padding:9px}.trade-plan-card{background:var(--panel2);padding:10px;border-top:2px solid var(--gold);min-width:0}.trade-plan-title b,.trade-plan-title small{display:block}.trade-plan-title b{color:var(--text);overflow-wrap:anywhere}.trade-plan-title small,.trade-plan-evidence{color:var(--muted);font-size:11px;line-height:1.5;margin-top:4px}.trade-plan-card>div:not(.trade-plan-title):not(.trade-plan-evidence){font-size:11px;color:var(--muted);line-height:1.5;margin-top:7px}.trade-plan-card strong{color:var(--gold);display:block}.trade-plan-card button{margin-top:8px}@media(max-width:1200px){.trade-plan-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:600px){.trade-plan-grid{grid-template-columns:1fr}}';document.head.appendChild(style)
 }
-const sectorAgentBox=document.querySelector('#sectorAgentChart')?.parentElement;if(sectorAgentBox&&!document.querySelector('#sectorAgentCurrent')){const box=document.createElement('div');box.id='sectorAgentCurrent';box.className='agent-current';sectorAgentBox.appendChild(box);const render=()=>{const rows=selectedSector?.agent_flows||[];box.innerHTML='<div class="agent-current-title">当前板块代理资金明细 <small>5日主力净流回算；估算，不代表账户归属</small></div>'+rows.map(x=>`<div class="agent-current-row"><span>${escHtml(x.name)}<small>${escHtml(x.basis||'')} · 覆盖 ${fmt(x.coverage,0)} 家</small></span><b class="${cls(x.value)}">${fmt(x.value)}亿</b><em>${escHtml(x.direction||'暂无数据')}</em></div>`).join('')||'<div class="empty">暂无足够覆盖数据</div>'};const prior=renderSector;renderSector=function(){prior();render()};render()}
+const sectorAgentBox=document.querySelector('#sectorAgentChart')?.parentElement;if(sectorAgentBox&&!document.querySelector('#sectorAgentCurrent')){const box=document.createElement('div');box.id='sectorAgentCurrent';box.className='agent-current';sectorAgentBox.appendChild(box);const render=()=>{const rows=selectedSector?.agent_flows||[];box.innerHTML='<div class="agent-current-title">当前板块代理资金明细 <small>按订单规模与股票特征回算；估算，不代表账户归属</small></div>'+rows.map(x=>`<div class="agent-current-row"><span>${escHtml(x.name)}<small>${escHtml(x.basis||'')} · ${escHtml(x.window||'可用窗口')} · 覆盖 ${fmt(x.coverage,0)} 家</small></span><b class="${cls(x.value)}">${fmt(x.value)}亿</b><em>${escHtml(x.direction||'暂无数据')}</em></div>`).join('')||'<div class="empty">暂无足够覆盖数据</div>'};const prior=renderSector;renderSector=function(){prior();render()};render()}
 const agentCurrentStyle=document.createElement('style');agentCurrentStyle.textContent='.agent-current{padding:9px;border-top:1px solid var(--line2)}.agent-current-title{color:var(--gold);font-weight:700;margin-bottom:5px}.agent-current-title small{color:var(--muted);font-weight:400;margin-left:8px}.agent-current-row{display:grid;grid-template-columns:1fr 80px 60px;gap:7px;padding:6px 0;border-bottom:1px solid var(--line2);font-size:12px}.agent-current-row small{display:block;color:var(--muted);font-size:10px;margin-top:2px}.agent-current-row b{text-align:right}.agent-current-row em{text-align:right;font-style:normal;color:var(--muted)}';document.head.appendChild(agentCurrentStyle)
 ''' + etf_observer_ui
     template = template.replace('</script></body></html>', trade_plan_ui + '</script></body></html>')
