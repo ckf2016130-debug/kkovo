@@ -75,12 +75,14 @@ def fetch_active_concepts(pro, trade_date, start_date, end_date):
     if member_rows:
         members = pd.concat(member_rows, ignore_index=True).drop_duplicates()
         members.to_csv(member_path, index=False, encoding="utf-8-sig")
+        print(f"OK ths_member: {len(members):,} rows -> {member_path}")
         results.append({"api": "ths_member", "rows": len(members), "file": str(member_path), "error": "; ".join(errors) or None})
     else:
         results.append({"api": "ths_member", "rows": 0, "file": str(member_path), "error": "; ".join(errors) or "empty response"})
     if daily_rows:
         history = pd.concat(daily_rows, ignore_index=True).drop_duplicates()
         history.to_csv(daily_path, index=False, encoding="utf-8-sig")
+        print(f"OK ths_daily: {len(history):,} rows -> {daily_path}")
         results.append({"api": "ths_daily", "rows": len(history), "file": str(daily_path), "error": "; ".join(errors) or None})
     else:
         results.append({"api": "ths_daily", "rows": 0, "file": str(daily_path), "error": "; ".join(errors) or "empty response"})
@@ -118,6 +120,7 @@ def fetch_focus_etf_components(pro, trade_date):
         return {"api": "etf_focus_cons", "rows": 0, "file": str(target_path), "error": "; ".join(errors) or "empty response"}
     combined = pd.concat(rows, ignore_index=True).drop_duplicates()
     combined.to_csv(target_path, index=False, encoding="utf-8-sig")
+    print(f"OK etf_focus_cons: {len(combined):,} rows -> {target_path}")
     return {"api": "etf_focus_cons", "rows": len(combined), "file": str(target_path), "error": "; ".join(errors) or None}
 
 

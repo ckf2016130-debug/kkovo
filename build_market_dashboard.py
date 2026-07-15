@@ -322,7 +322,7 @@ def load_data():
             component = pd.concat(component_rows, ignore_index=True).drop_duplicates(["ts_code", "con_code"], keep="last")
             component["weight"] = pd.to_numeric(component.get("weight"), errors="coerce")
             component["qty"] = pd.to_numeric(component.get("qty"), errors="coerce")
-            latest_close = pd.DataFrame(prices)
+            latest_close = price.copy()
             if not latest_close.empty and {"ts_code", "trade_date", "close"}.issubset(latest_close.columns):
                 latest_close["trade_date"] = latest_close["trade_date"].astype(str)
                 latest_close["close"] = pd.to_numeric(latest_close["close"], errors="coerce")
