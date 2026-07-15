@@ -35,9 +35,10 @@ def load_etfs():
         daily["trade_date"] = daily["trade_date"].astype(str)
         daily["close"] = pd.to_numeric(daily["close"], errors="coerce")
         daily = daily.dropna(subset=["ts_code", "trade_date", "close"]).sort_values(["ts_code", "trade_date"])
+        window_counts = daily.groupby("ts_code")["trade_date"].nunique().rename("window_days")
         first = daily.groupby("ts_code", as_index=False).first()[["ts_code", "trade_date", "close"]].rename(columns={"trade_date":"start_date", "close":"start_close"})
         last = daily.groupby("ts_code", as_index=False).last()[["ts_code", "trade_date", "close", "amount"]].rename(columns={"trade_date":"trade_date", "close":"close", "amount":"amount"})
-        out = basic.merge(last, on="ts_code", how="inner").merge(first, on="ts_code", how="left")
+        out = basic.merge(last, on="ts_code", how="inner").merge(first, on="ts_code", how="left").merge(window_counts, on="ts_code", how="left")
         out["week_ret"] = (out["close"] / out["start_close"] - 1) * 100
         out.loc[out["trade_date"].astype(str) == out["start_date"].astype(str), "week_ret"] = pd.NA
         # TinyShare/Tushare fund_daily amount is in thousand yuan, same as stock daily amount.
@@ -87,6 +88,16 @@ def load_etfs():
             out["share_change_pct"] = (out["share_latest"] / out["share_start"] - 1) * 100
             insufficient_share_history = out["ts_code"].map(share_date_count).fillna(0) < 2
             out.loc[insufficient_share_history, ["share_change", "share_change_pct"]] = pd.NA
+        out["return_reliable"] = True
+        out["data_quality_note"] = ""
+        abnormal_return = out["week_ret"].abs() > 25
+        if "share_change_pct" in out:
+            suspected_split = abnormal_return & (pd.to_numeric(out["share_change_pct"], errors="coerce").abs() > 30)
+        else:
+            suspected_split = abnormal_return & (pd.to_numeric(out["window_days"], errors="coerce") <= 5)
+        out.loc[suspected_split, "return_reliable"] = False
+        out.loc[suspected_split, "data_quality_note"] = "价格与份额同时异常跳变，疑似份额折算/拆分；缺少复权依据，窗口收益不采用"
+        out.loc[suspected_split, "week_ret"] = pd.NA
         component_rows = []
         for component_path in sorted((ROOT / "data").glob("etf_*_cons_*.csv")):
             try:
@@ -112,7 +123,7 @@ def load_etfs():
         out["tool_role"] = out.apply(classify_etf, axis=1)
         out["tool_relevance_score"] = (pd.to_numeric(out["amount_yi"], errors="coerce").clip(lower=0, upper=20) / 20 * 50 + out["benchmark"].fillna("").astype(str).str.len().clip(upper=20) / 20 * 20).round(1)
         out["selection_reason"] = out.apply(lambda r: f"{r['tool_role']}；成交额 {float(r['amount_yi']):.2f}亿" if pd.notna(r.get("amount_yi")) else f"{r['tool_role']}；成交额缺失", axis=1)
-        return records(out[[c for c in ["ts_code", "name", "fund_type", "benchmark", "invest_type", "issue_amount", "trade_date", "close", "week_ret", "amount_yi", "nav_date", "unit_nav", "accum_nav", "net_asset", "premium_discount", "share_date", "share_latest", "share_change", "share_change_pct", "component_count", "cpr_mean", "tool_role", "tool_relevance_score", "selection_reason"] if c in out]])
+        return records(out[[c for c in ["ts_code", "name", "fund_type", "benchmark", "invest_type", "issue_amount", "trade_date", "close", "week_ret", "window_days", "return_reliable", "data_quality_note", "amount_yi", "nav_date", "unit_nav", "accum_nav", "net_asset", "premium_discount", "share_date", "share_latest", "share_change", "share_change_pct", "component_count", "cpr_mean", "tool_role", "tool_relevance_score", "selection_reason"] if c in out]])
     except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, KeyError):
         return []
 
@@ -555,7 +566,7 @@ def build():
             code = str(candidate.get("ts_code"))
             role = "龙头候选" if float(candidate.get("leader_score") or 0) >= max(float(candidate.get("core_score") or 0), float(candidate.get("elastic_score") or 0)) else "中军/趋势候选"
             trade_plan.append({"kind": "个股", "name": candidate.get("name"), "ts_code": code, "industry": trade_industry, "role": role, "price": float(latest_price_map[code]) if code in latest_price_map and pd.notna(latest_price_map[code]) else None, "evidence": f"周涨跌 {float(candidate.get('week_ret') or 0):.2f}% · 5日主力净流 {float(candidate.get('net_mf_5d_yi') or 0):.2f}亿 · 基本面覆盖 {float(candidate.get('fundamental_coverage') or 0):.0f}%", "continue_if": f"{trade_industry}资金继续为正，且该股相对板块不转弱", "drop_if": "板块资金转负、个股跌破支撑或龙头/中军同步走弱"})
-    for etf in sorted([x for x in etfs if x.get("tool_role") in {"宽基工具", "行业/风格工具", "海外联动"}], key=lambda x: float(x.get("tool_relevance_score") or 0), reverse=True)[:2]:
+    for etf in sorted([x for x in etfs if x.get("tool_role") in {"宽基工具", "行业/风格工具", "海外联动"} and x.get("return_reliable") is not False], key=lambda x: float(x.get("tool_relevance_score") or 0), reverse=True)[:2]:
         trade_plan.append({"kind": "ETF", "name": etf.get("name"), "ts_code": etf.get("ts_code"), "industry": etf.get("benchmark") or etf.get("tool_role"), "role": etf.get("tool_role"), "price": etf.get("close"), "evidence": etf.get("selection_reason") or "工具类型与成交额可用", "continue_if": "跟踪基准与对应板块方向同步，成交额和溢价/折价没有异常扩大", "drop_if": "跟踪基准脱钩、溢价/折价异常或成交流动性明显下降"})
     if mean_ret > 0 and (positive_flow or 0) < 50:
         main_conflict = "指数和个股表现改善，但资金广度不足，仍是存量轮动而非全面增量"
@@ -962,6 +973,7 @@ def build():
         "valuation_percentile": pe_percentile,
         "valuation_coverage": len(pe),
         "etf_count": len(etfs),
+        "etf_quality_excluded": sum(1 for x in etfs if x.get("return_reliable") is False),
         "etf_window": sorted({str(x.get("trade_date")) for x in etfs if x.get("trade_date")}),
         "market_state": market_state,
         "market_state_evidence": state_evidence,
@@ -1065,7 +1077,7 @@ def build():
         digits = "".join(ch for ch in code if ch.isdigit())
         shard = digits[:4] or "other"
         history_shards.setdefault(shard, {})[code] = item
-    display_etfs = [x for x in etfs if x.get("tool_role") != "主题待确认" and float(x.get("tool_relevance_score") or 0) >= 45][:24]
+    display_etfs = [x for x in etfs if x.get("tool_role") != "主题待确认" and x.get("return_reliable") is not False and float(x.get("tool_relevance_score") or 0) >= 45][:24]
     replacements = {
         "__SECTORS__": json.dumps(sectors, ensure_ascii=False, separators=(",", ":")),
         "__STOCKS__": json.dumps(stocks, ensure_ascii=False, separators=(",", ":")),
@@ -1083,7 +1095,7 @@ def build():
     valuation_ui = r'''const priorValuationRange=typeof updateValuationRange==='function'?updateValuationRange:null;if(priorValuationRange){updateValuationRange=function(){priorValuationRange();const box=document.querySelector('#valuationOverview');if(!box)return;let note=box.querySelector('.valuation-assumption-note');if(!note){note=document.createElement('div');note.className='valuation-assumption-note source';box.appendChild(note)}const names=typeof valuationModels==='function'?valuationModels().map(x=>x.name).join('、'):'';note.textContent=`估值解释：仅使用真实正值输入形成 ${names||'暂无可用'} 模型；中性参考价、悲观和乐观边界分别取可用模型对应情景的中位数，不使用固定回退倍数，也不让单一极端模型直接决定区间。当前假设：PE ${document.querySelector('#vPeBase')?.value||'—'} 倍、PB ${document.querySelector('#vPbBase')?.value||'—'} 倍、FCFE增长 ${document.querySelector('#vGrowth')?.value||'—'}%、折现率 ${document.querySelector('#vDiscount')?.value||'—'}%、永续增长 ${document.querySelector('#vTerminal')?.value||'—'}%。财务覆盖率 ${fmt(selectedStock?.fundamental_coverage,0)}%；结果只作区间观察，不是目标价。`};updateValuationRange();document.querySelectorAll('.valuation-form input').forEach(i=>i.addEventListener('input',()=>setTimeout(updateValuationRange,0)))}const valuationStyle=document.createElement('style');valuationStyle.textContent='.valuation-assumption-note{grid-column:1/-1;padding:8px;background:var(--panel2);line-height:1.6}';document.head.appendChild(valuationStyle)
 '''
     template = template.replace("const sectorAgentBox", stock_agent_ui + "const sectorAgentBox")
-    etf_share_ui = r'''const etfShareBox=document.querySelector('#etfBoard');if(etfShareBox&&!document.querySelector('#etfShareEvidence')){const rows=etfs.filter(x=>x.share_change_pct!==null&&x.share_change_pct!==undefined).slice(0,8);etfShareBox.insertAdjacentHTML('beforeend',`<div id="etfShareEvidence" class="source etf-share-evidence"><b>基金份额变化</b>：${rows.length?rows.map(x=>`${escHtml(x.name||x.ts_code)} ${fmt(x.share_change_pct,2)}%`).join(' · '):'接口未返回基金份额变化，无法估算申赎方向'}。该指标是基金份额快照变化，不等于纯申购赎回金额；需结合净值、价格和成交额判断。</div>`);const style=document.createElement('style');style.textContent='.etf-share-evidence{padding:8px;background:var(--panel2);line-height:1.6}.etf-share-evidence b{color:var(--gold)}';document.head.appendChild(style)}
+    etf_share_ui = r'''const etfShareBox=document.querySelector('#etfBoard');if(etfShareBox&&!document.querySelector('#etfShareEvidence')){const rows=etfs.filter(x=>x.share_change_pct!==null&&x.share_change_pct!==undefined).slice(0,8),excluded=Number(summary.etf_quality_excluded||0);etfShareBox.insertAdjacentHTML('beforeend',`<div id="etfShareEvidence" class="source etf-share-evidence"><b>基金份额变化</b>：${rows.length?rows.map(x=>`${escHtml(x.name||x.ts_code)} ${fmt(x.share_change_pct,2)}%`).join(' · '):'接口未返回基金份额变化，无法估算申赎方向'}。该指标是基金份额快照变化，不等于纯申购赎回金额；需结合净值、价格和成交额判断。${excluded?` 已剔除 ${excluded} 只疑似份额折算/拆分且缺少复权依据的异常样本。`:''}</div>`);const style=document.createElement('style');style.textContent='.etf-share-evidence{padding:8px;background:var(--panel2);line-height:1.6}.etf-share-evidence b{color:var(--gold)}';document.head.appendChild(style)}
 '''
     news_ui = r'''const impactMapSection=document.querySelector('.impact-map'),newsView=document.querySelector('#newsView');if(impactMapSection&&newsView&&impactMapSection.parentElement!==newsView)newsView.appendChild(impactMapSection);const impactMap=document.querySelector('#newsImpactMap');if(impactMap&&!document.querySelector('#impactNewsSwitcher')){const sw=document.createElement('div');sw.id='impactNewsSwitcher';sw.className='impact-news-switcher';const rows=(summary.news_briefs||news).slice().sort((a,b)=>Number(b.value_score||0)-Number(a.value_score||0)).slice(0,12);sw.innerHTML='<button class="btn active" data-impact-index="all">全部消息</button>'+rows.slice(0,3).map((x,i)=>`<button class="btn" data-impact-index="${i}">消息${i+1}</button>`).join('');impactMap.parentNode.insertBefore(sw,impactMap);const apply=i=>{impactMap.querySelectorAll('.impact-item').forEach((el,n)=>el.style.display=i===null||n===i?'':'none');sw.querySelectorAll('button').forEach((b,n)=>b.classList.toggle('active',(i===null&&n===0)||(i!==null&&n===i+1)))};sw.querySelectorAll('button').forEach(b=>b.onclick=()=>apply(b.dataset.impactIndex==='all'?null:Number(b.dataset.impactIndex)))}const impactSwitchStyle=document.createElement('style');impactSwitchStyle.textContent='.impact-news-switcher{display:flex;gap:5px;padding:8px 9px;border:1px solid var(--line);border-bottom:0;background:var(--panel);overflow:auto}.impact-news-switcher .btn{white-space:nowrap}';document.head.appendChild(impactSwitchStyle);
 '''
