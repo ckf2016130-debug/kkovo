@@ -48,6 +48,9 @@ jobs:
           TUSHARE_API_URL: https://fastapic.stockai888.top
         run: timeout 240s python fetch_tinyshare_week.py || echo "Market source timeout or authorization lock; previous snapshot will be used"
 
+      - name: Fetch free intraday snapshot
+        run: timeout 120s python fetch_intraday_free.py || echo "Free intraday source failed; previous snapshot will be used"
+
       - name: Fetch concept and ETF intelligence
         env:
           TUSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}

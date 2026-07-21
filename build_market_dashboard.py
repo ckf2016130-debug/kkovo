@@ -426,6 +426,11 @@ def build():
         news = []
     numeric_stocks = pd.to_numeric(pd.Series([x.get("week_ret") for x in stocks]), errors="coerce").dropna()
     generated_at = pd.Timestamp.now(tz="Asia/Shanghai").isoformat(timespec="seconds")
+    intraday_manifest_path = ROOT / "data" / "intraday" / "manifest.json"
+    try:
+        intraday = json.loads(intraday_manifest_path.read_text(encoding="utf-8")) if intraday_manifest_path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        intraday = {}
     history_path = ROOT / "data" / "decision_history.json"
     try:
         decision_history = json.loads(history_path.read_text(encoding="utf-8")) if history_path.exists() else []
@@ -1480,6 +1485,7 @@ def build():
         "generated_at": generated_at,
         "source": "TinyShare授权接口 + 本地消息快照",
         "freshness": "按最近成功抓取批次生成；非实时",
+        "intraday": intraday,
         "estimated": True,
         "sentiment_score": sentiment,
         "money_effect_score": money_effect,
