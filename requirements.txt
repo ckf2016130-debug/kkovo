@@ -1,5 +1,5 @@
 pandas>=2.0
-tinyshare==0.1036.0
+tushare>=1.4.13
 akshare>=1.18.0
 requests>=2.31
 beautifulsoup4>=4.12

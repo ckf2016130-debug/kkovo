@@ -3,15 +3,13 @@ import time
 from datetime import date, timedelta
 from pathlib import Path
 
-import tinyshare as ts
+from tushare_proxy import create_pro
 
 
 OUT = Path("data/history")
 
 
-ts.set_token(os.environ["TINYSHARE_TOKEN"])
-pro = ts.pro_api()
-pro.timeout = 25
+pro = create_pro(timeout=25)
 OUT.mkdir(parents=True, exist_ok=True)
 
 end = date.today()

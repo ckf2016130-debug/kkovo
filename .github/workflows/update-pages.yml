@@ -44,17 +44,20 @@ jobs:
 
       - name: Fetch market data
         env:
-          TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
+          TUSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
+          TUSHARE_API_URL: https://fastapic.stockai888.top
         run: timeout 240s python fetch_tinyshare_week.py || echo "Market source timeout or authorization lock; previous snapshot will be used"
 
       - name: Fetch concept and ETF intelligence
         env:
-          TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
+          TUSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
+          TUSHARE_API_URL: https://fastapic.stockai888.top
         run: timeout 240s python fetch_tinyshare_intelligence.py || echo "Concept or ETF intelligence timeout/permission failure; available snapshots will be used"
 
       - name: Ensure K-line history window
         env:
-          TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
+          TUSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
+          TUSHARE_API_URL: https://fastapic.stockai888.top
         run: timeout 240s python fetch_tinyshare_history.py || echo "K-line history source timeout; previous history snapshot will be used"
 
       - name: Fetch overseas market data
@@ -65,7 +68,8 @@ jobs:
 
       - name: Fetch fundamental data
         env:
-          TINYSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
+          TUSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
+          TUSHARE_API_URL: https://fastapic.stockai888.top
         run: timeout 240s python fetch_tinyshare_fundamentals.py || echo "Fundamental source timeout or authorization lock; previous snapshot will be used"
 
       - name: Fetch and score news

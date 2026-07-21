@@ -2,16 +2,14 @@ import json
 import os
 from pathlib import Path
 
-import tinyshare as ts
+from tushare_proxy import create_pro
 
 
 PERIOD = "20260331"
 OUT = Path("data/fundamentals")
 OUT.mkdir(parents=True, exist_ok=True)
 
-ts.set_token(os.environ["TINYSHARE_TOKEN"])
-pro = ts.pro_api()
-pro.timeout = 45
+pro = create_pro(timeout=45)
 
 manifest = []
 for api in ["fina_indicator_vip", "income_vip", "balancesheet_vip", "cashflow_vip", "express_vip"]:

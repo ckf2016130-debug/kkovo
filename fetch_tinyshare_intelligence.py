@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 import pandas as pd
-import tinyshare as ts
+from tushare_proxy import create_pro
 
 from fetch_tinyshare_week import OUT, fetch, fetch_active_concepts, fetch_focus_etf_components
 
@@ -59,9 +59,7 @@ def fetch_focus_etf_valuation(pro, dates):
 
 def main():
     OUT.mkdir(exist_ok=True)
-    ts.set_token(os.environ["TINYSHARE_TOKEN"])
-    pro = ts.pro_api()
-    pro.timeout = 20
+    pro = create_pro(timeout=20)
 
     daily_dates = sorted(
         path.stem.split("_")[-1]
