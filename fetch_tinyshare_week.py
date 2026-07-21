@@ -151,14 +151,14 @@ def main():
     ))
 
     for trade_date in history_dates:
+        if trade_date not in dates:
+            continue
         for api_name, prefix, fields in [
             ("daily", "daily", ""),
             ("daily_basic", "daily_basic", "ts_code,trade_date,close,turnover_rate,turnover_rate_f,volume_ratio,pe,pb,total_share,float_share,free_share,total_mv,circ_mv"),
             ("moneyflow", "moneyflow", ""),
             ("limit_list_d", "limit_list", ""),
         ]:
-            if trade_date not in dates and api_name != "daily":
-                continue
             kwargs = {"trade_date": trade_date}
             if fields:
                 kwargs["fields"] = fields
