@@ -1289,17 +1289,37 @@ def build():
                 "title": "代表指数与个股上涨宽度方向背离",
                 "before": index_day_ret,
                 "after": latest_breadth,
+                "divergence_type": "指数—个股上涨宽度背离",
+                "comparison": "代表指数涨跌 vs 全市场上涨股票占比",
+                "sample_grade": "全市场",
+                "observation": "观察指数涨跌是否与上涨家数连续两个交易日重新同步",
                 "before_text": f"指数 {index_day_ret:+.2f}%",
                 "after_text": f"上涨宽度 {latest_breadth:.1f}%",
                 "meaning": "指数上涨但多数个股未跟随时偏权重护盘；指数下跌而多数个股上涨时说明局部风险偏好更强。",
                 "confidence": "中",
                 "validation": "检查主要宽基指数、成交额和上涨中位数是否连续两个交易日保持背离。",
             })
+        sample_rows = latest_snapshot.dropna(subset=["industry", "ts_code"]).copy()
+        sector_sample_info = {}
+        for sample_industry, sample_group in sample_rows.groupby("industry"):
+            sample_group = sample_group.drop_duplicates("ts_code")
+            sample_count = int(sample_group["ts_code"].nunique())
+            up_count = int((sample_group["pct_chg"] > 0).sum())
+            grade = "大样本" if sample_count >= 10 else "中样本" if sample_count >= 5 else "小样本"
+            members = stocks_frame[stocks_frame["ts_code"].isin(sample_group["ts_code"])].copy()
+            member_names = members[["name", "ts_code"]].drop_duplicates().head(8).apply(lambda row: f"{row['name']} {row['ts_code']}", axis=1).tolist()
+            sector_sample_info[str(sample_industry)] = {
+                "count": sample_count,
+                "up_count": up_count,
+                "grade": grade,
+                "members": member_names,
+            }
         by_code_ret = latest_snapshot.set_index("ts_code")["pct_chg"]
         for sector in sectors:
             industry = str(sector.get("industry"))
             sector_ret = daily_sector_returns.get(industry)
             sector_flow = latest_sector_flow.get(industry)
+            sample_info = sector_sample_info.get(industry, {"count": 0, "up_count": 0, "grade": "无样本", "members": []})
             if sector_ret is not None and sector_flow is not None and ((sector_ret >= 1 and sector_flow < 0) or (sector_ret <= -1 and sector_flow > 0)):
                 changes.append({
                     "time": latest_price_date,
@@ -1307,6 +1327,12 @@ def build():
                     "title": f"{industry}价格与资金方向相反",
                     "before": sector_ret,
                     "after": sector_flow,
+                    "divergence_type": "价格—资金背离",
+                    "comparison": "板块价格 vs 最近一个交易日主力资金",
+                    "sample_count": sample_info["count"],
+                    "sample_grade": sample_info["grade"],
+                    "sample_members": sample_info["members"],
+                    "observation": "小样本，仅观察成分股分化" if sample_info["count"] < 5 else "下一交易日观察价格与资金是否重新同向，并核对龙头和中军",
                     "before_text": f"板块 {sector_ret:+.2f}%",
                     "after_text": f"资金 {sector_flow:+.2f}亿",
                     "meaning": "上涨流出需警惕冲高兑现；下跌流入可能是承接，也可能是抄底尚未被价格确认。",
@@ -1322,6 +1348,12 @@ def build():
                     "title": f"{industry}龙头与板块强弱背离",
                     "before": float(leader_ret),
                     "after": float(sector_ret),
+                    "divergence_type": "龙头—板块背离",
+                    "comparison": "板块龙头单日涨跌 vs 板块成分股等权涨跌",
+                    "sample_count": sample_info["count"],
+                    "sample_grade": sample_info["grade"],
+                    "sample_members": sample_info["members"],
+                    "observation": "观察龙头、中军和板块上涨宽度是否重新同步",
                     "before_text": f"{sector.get('leader_name') or '龙头候选'} {float(leader_ret):+.2f}%",
                     "after_text": f"板块 {float(sector_ret):+.2f}%",
                     "meaning": "龙头明显弱于板块可能表示核心地位松动；龙头独强则需警惕板块跟随不足。",
@@ -1359,6 +1391,12 @@ def build():
                     "title": f"{industry}利好尚未获得价格和资金共同确认",
                     "before": float(sector_ret) if sector_ret is not None else None,
                     "after": float(sector_flow) if sector_flow is not None else None,
+                    "divergence_type": "消息—价格资金背离",
+                    "comparison": "利好方向 vs 板块价格和主力资金",
+                    "sample_count": sector_sample_info.get(industry, {}).get("count", 0),
+                    "sample_grade": sector_sample_info.get(industry, {}).get("grade", "无样本"),
+                    "sample_members": sector_sample_info.get(industry, {}).get("members", []),
+                    "observation": "打开消息原文，观察下一交易日板块、龙头/中军和对应ETF是否共同转强",
                     "before_text": f"板块 {float(sector_ret):+.2f}%" if sector_ret is not None else "板块价格缺失",
                     "after_text": f"资金 {float(sector_flow):+.2f}亿" if sector_flow is not None else "板块资金缺失",
                     "meaning": "利好可能已提前交易、映射错误或不足以改变原有趋势，不能仅凭标题追涨。",
@@ -1433,6 +1471,11 @@ def build():
             "title": f"{etf.get('name') or etf.get('ts_code')}与A股篮子收益背离",
             "before": float(basket_return),
             "after": float(etf_return),
+            "divergence_type": "ETF—成分篮子收益背离",
+            "comparison": "ETF复权收益 vs 成分股权重估算收益",
+            "sample_count": int(round(coverage * 100)),
+            "sample_grade": "权重覆盖率",
+            "observation": "先核对净值日期、溢折价、非A股成分和现金替代；差异过大时按数据口径异常处理",
             "before_text": f"A股篮子估算 {float(basket_return):+.2f}%",
             "after_text": f"ETF复权收益 {float(etf_return):+.2f}%",
             "meaning": "ETF价格与可计算A股篮子表现不同步，可能来自海外/港股成分、现金替代、净值时差、申赎供需或跟踪误差，不能直接解释为套利空间。",
