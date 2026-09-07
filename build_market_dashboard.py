@@ -1778,7 +1778,7 @@ const newsValidationStyle=document.createElement('style');newsValidationStyle.te
     (OUT / "market_context.json").write_text(json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8")
     vendor = OUT / "vendor"
     vendor.mkdir(exist_ok=True)
-    for name in ["echarts.min.js", "tabulator.min.js", "tabulator_midnight.min.css"]:
+    for name in ["echarts.min.js", "tabulator.min.js", "tabulator_midnight.min.css", "review.js"]:
         (vendor / name).write_bytes((SOURCE_VENDOR / name).read_bytes())
     (OUT / "index.html").write_text(template, encoding="utf-8")
     print(OUT / "index.html")
