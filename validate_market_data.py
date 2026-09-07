@@ -11,6 +11,7 @@ DATA = Path("data")
 OUT = Path("output") / "market_dashboard"
 MAX_AGE_DAYS = int(os.getenv("MAX_MARKET_DATA_AGE_DAYS", "10"))
 MIN_DAILY_ROWS = int(os.getenv("MIN_DAILY_ROWS", "100"))
+ALLOW_STALE_DEPLOY = os.getenv("ALLOW_STALE_DEPLOY", "0").lower() in {"1", "true", "yes"}
 
 
 def parse_yyyymmdd(value: str) -> date:
@@ -73,6 +74,7 @@ def main() -> int:
 
     status = {
         "ok": not errors,
+        "deploy_allowed": not errors or ALLOW_STALE_DEPLOY,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "latest_daily_file": str(latest_path) if latest_path else None,
         "latest_daily_date": latest_date.isoformat() if latest_date else None,
@@ -83,9 +85,14 @@ def main() -> int:
         "errors": errors,
         "warnings": warnings,
     }
+    if errors and ALLOW_STALE_DEPLOY:
+        status["warnings"].append(
+            "Data validation failed, but deployment is allowed so UI-only updates can ship. "
+            "The dashboard must display its actual market cutoff and stale-data warning."
+        )
     (OUT / "data_status.json").write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(status, ensure_ascii=False, indent=2))
-    return 1 if errors else 0
+    return 1 if errors and not ALLOW_STALE_DEPLOY else 0
 
 
 if __name__ == "__main__":

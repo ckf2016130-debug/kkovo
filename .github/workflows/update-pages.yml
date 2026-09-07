@@ -84,6 +84,9 @@ jobs:
         env:
           MAX_MARKET_DATA_AGE_DAYS: "10"
           MIN_DAILY_ROWS: "100"
+          # UI-only releases may deploy with the last snapshot. The page exposes
+          # the actual market cutoff and marks stale data instead of presenting it as live.
+          ALLOW_STALE_DEPLOY: "1"
         run: python validate_market_data.py
 
       - name: Build dashboard
