@@ -103,6 +103,18 @@ jobs:
           key: dashboard-data-${{ github.run_id }}
           restore-keys: dashboard-data-
 
+      - name: Bootstrap verified free history when the main-branch cache is empty
+        # Feature-branch caches cannot be restored by main. The verified artifact
+        # bridges that first deployment; later runs use the normal data cache.
+        if: hashFiles('data/free/manifest.json') == ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: free-market-data
+          path: data
+          run-id: ${{ inputs.restore_run || '34242894861' }}
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
         run: python -m pip install pandas numpy requests akshare beautifulsoup4
 
