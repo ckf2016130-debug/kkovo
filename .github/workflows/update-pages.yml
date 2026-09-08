@@ -11,11 +11,15 @@ on:
         description: Read-only market source diagnostics without publishing
         type: boolean
         default: false
+      collect_only:
+        description: Fetch and validate free history without publishing
+        type: boolean
+        default: false
   push:
     branches: [main, master]
 
 concurrency:
-  group: dashboard-update-${{ inputs.diagnose_only && 'diagnose' || 'publish' }}
+  group: dashboard-update-${{ inputs.diagnose_only && 'diagnose' || inputs.collect_only && 'collect' || 'publish' }}
   cancel-in-progress: true
 
 permissions:
@@ -24,6 +28,34 @@ permissions:
   id-token: write
 
 jobs:
+  collect:
+    if: github.event_name == 'workflow_dispatch' && inputs.collect_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: dashboard-data-${{ github.run_id }}
+          restore-keys: dashboard-data-
+      - run: python -u fetch_free_market.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: free-market-data
+          path: |
+            data/free
+            data/stock_basic.csv
+      - uses: actions/cache/save@v4
+        if: success()
+        with:
+          path: data
+          key: dashboard-data-${{ github.run_id }}
+
   diagnose:
     if: github.event_name == 'workflow_dispatch' && inputs.diagnose_only
     runs-on: ubuntu-latest
@@ -41,7 +73,7 @@ jobs:
         run: timeout 180s python -u diagnose_market_source.py
 
   build-and-deploy:
-    if: ${{ !inputs.diagnose_only }}
+    if: ${{ !inputs.diagnose_only && !inputs.collect_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment:
