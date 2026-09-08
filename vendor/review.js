@@ -155,7 +155,7 @@ ${text(record.reviewLesson)}
     renderHistory(date);
   };
 
-  window.addEventListener("DOMContentLoaded", () => {
+  const initializeReview = () => {
     document.querySelectorAll(".head").forEach(head => {
       if (head.textContent.trim().startsWith("AI解释入口")) head.closest(".panel")?.remove();
     });
@@ -173,5 +173,7 @@ ${text(record.reviewLesson)}
     byId("saveReview").addEventListener("click", save);
     byId("exportReview").addEventListener("click", exportMarkdown);
     byId("clearReview").addEventListener("click", clearCurrent);
-  });
+  };
+  if (document.readyState === "loading") window.addEventListener("DOMContentLoaded", initializeReview, {once:true});
+  else initializeReview();
 })();
