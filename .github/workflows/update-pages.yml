@@ -6,6 +6,11 @@ on:
     - cron: "35 7 * * 1-5"
     - cron: "10 9 * * 1-5"
   workflow_dispatch:
+    inputs:
+      diagnose_only:
+        description: Read-only market source diagnostics without publishing
+        type: boolean
+        default: false
   push:
     branches: [main, master]
 
@@ -19,7 +24,24 @@ permissions:
   id-token: write
 
 jobs:
+  diagnose:
+    if: github.event_name == 'workflow_dispatch' && inputs.diagnose_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pandas tushare
+      - name: Probe source schemas and dates
+        env:
+          TUSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
+          TUSHARE_API_URL: https://fastapic.stockai888.top
+        run: timeout 180s python -u diagnose_market_source.py
+
   build-and-deploy:
+    if: ${{ !inputs.diagnose_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment:
@@ -48,7 +70,7 @@ jobs:
         env:
           TUSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
           TUSHARE_API_URL: https://fastapic.stockai888.top
-        run: timeout 240s python fetch_tinyshare_week.py || echo "Market source timeout or authorization lock; previous snapshot will be used"
+        run: timeout 240s python fetch_tinyshare_week.py || echo "::warning::Market refresh failed; inspect source errors above. Previous snapshot retained."
 
       - name: Fetch free intraday snapshot
         run: timeout 120s python fetch_intraday_free.py || echo "Free intraday source failed; previous snapshot will be used"
@@ -92,7 +114,7 @@ jobs:
       - name: Build dashboard
         # Pure signal checks run before generating a new published observation pool.
         run: |
-          python -m unittest test_pattern_watchlist.py test_dashboard_delivery.py
+          python -m unittest test_pattern_watchlist.py test_dashboard_delivery.py test_market_source.py
           python build_market_dashboard.py
 
       - name: Save successful data snapshot
@@ -113,3 +135,8 @@ jobs:
       - name: Deploy Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Report stale market data as an update failure
+        # Preserve the usable website, but do not mark stale refreshes successful.
+        run: |
+          python -c "import json,sys; s=json.load(open('output/market_dashboard/data_status.json')); print(s['errors']); sys.exit(0 if s['ok'] else 1)"
