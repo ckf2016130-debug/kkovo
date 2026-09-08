@@ -4,6 +4,7 @@ import math
 from pathlib import Path
 
 import pandas as pd
+from pattern_watchlist import build_pattern_pool
 
 
 ROOT = Path(__file__).parent
@@ -1758,6 +1759,7 @@ const newsValidationStyle=document.createElement('style');newsValidationStyle.te
     trade_plan_ui += concept_change_ui + news_validation_ui
     template = template.replace('</script></body></html>', trade_plan_ui + '</script></body></html>')
     OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "pattern_pool.json").write_text(json.dumps(build_pattern_pool(prices, stocks), ensure_ascii=False, allow_nan=False, separators=(",", ":")), encoding="utf-8")
     history_out = OUT / "history"
     history_out.mkdir(exist_ok=True)
     for stale in history_out.glob("*.json"):
@@ -1778,7 +1780,7 @@ const newsValidationStyle=document.createElement('style');newsValidationStyle.te
     (OUT / "market_context.json").write_text(json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8")
     vendor = OUT / "vendor"
     vendor.mkdir(exist_ok=True)
-    for name in ["echarts.min.js", "tabulator.min.js", "tabulator_midnight.min.css", "review.js"]:
+    for name in ["echarts.min.js", "tabulator.min.js", "tabulator_midnight.min.css", "review.js", "pattern-watchlist.js"]:
         (vendor / name).write_bytes((SOURCE_VENDOR / name).read_bytes())
     (OUT / "index.html").write_text(template, encoding="utf-8")
     print(OUT / "index.html")
