@@ -4,6 +4,8 @@ import math
 from pathlib import Path
 
 import pandas as pd
+from pattern_watchlist import build_pattern_pool
+from dashboard_delivery import package_dashboard
 
 
 ROOT = Path(__file__).parent
@@ -1682,8 +1684,9 @@ def build():
         "__ETFS__": json.dumps(display_etfs, ensure_ascii=False, separators=(",", ":")),
         "__STOCK_FLOWS__": "[]",
     }
-    for key, value in replacements.items():
-        template = template.replace(key, value)
+    datasets = {key: json.loads(value) for key, value in replacements.items()}
+    for key in replacements:
+        template = template.replace(key, 'window.__MARKET_DATA__[' + json.dumps(key) + ']')
     stock_agent_ui = r'''const stockAgentAnchor=document.querySelector('#stockView .stock-evidence');if(stockAgentAnchor&&!document.querySelector('#stockAgentChart')){const panel=document.createElement('section');panel.className='panel stock-agent-evidence';panel.innerHTML='<div class="head">个股四类代理资金 <small>按订单规模与股票特征回算；估算，不代表账户归属</small></div><div id="stockAgentChart" class="chart"></div>';stockAgentAnchor.parentNode.insertBefore(panel,stockAgentAnchor.nextSibling);const chart=echarts.init(document.querySelector('#stockAgentChart'));const names=['国家队代理','机构代理','游资代理','散户代理'],colors=[C.gold,C.cyan,C.up,C.down];const render=()=>{const rows=selectedStock?.agent_series||[],dates=[...new Set(rows.map(x=>String(x.trade_date)))].sort();chart.setOption({animation:false,tooltip:{...tooltip,trigger:'axis'},legend:{data:names,textStyle:{color:C.muted}},grid:{left:58,right:18,top:35,bottom:32},xAxis:{type:'category',data:dates.map(shortDate),axisLabel:{color:C.muted}},yAxis:{name:'亿元',axisLabel:{color:C.muted},splitLine:{lineStyle:{color:'#24303a'}}},series:names.map((name,i)=>({name,type:'line',showSymbol:false,smooth:true,data:dates.map(d=>{const x=rows.find(v=>String(v.trade_date)===d&&v.name===name);return x?x.value:null}),lineStyle:{color:colors[i]},itemStyle:{color:colors[i]}}))},true)};const prior=renderStock;renderStock=function(){prior();render()};render()}const stockAgentStyle=document.createElement('style');stockAgentStyle.textContent='.stock-agent-evidence{height:300px;margin-top:7px}.stock-agent-evidence .chart{height:calc(100% - 39px)}';document.head.appendChild(stockAgentStyle)
 '''
     valuation_ui = r'''const priorValuationRange=typeof updateValuationRange==='function'?updateValuationRange:null;if(priorValuationRange){updateValuationRange=function(){priorValuationRange();const box=document.querySelector('#valuationOverview');if(!box)return;let note=box.querySelector('.valuation-assumption-note');if(!note){note=document.createElement('div');note.className='valuation-assumption-note source';box.appendChild(note)}const names=typeof valuationModels==='function'?valuationModels().map(x=>x.name).join('、'):'';note.textContent=`估值解释：仅使用真实正值输入形成 ${names||'暂无可用'} 模型；中性参考价、悲观和乐观边界分别取可用模型对应情景的中位数，不使用固定回退倍数，也不让单一极端模型直接决定区间。当前假设：PE ${document.querySelector('#vPeBase')?.value||'—'} 倍、PB ${document.querySelector('#vPbBase')?.value||'—'} 倍、FCFE增长 ${document.querySelector('#vGrowth')?.value||'—'}%、折现率 ${document.querySelector('#vDiscount')?.value||'—'}%、永续增长 ${document.querySelector('#vTerminal')?.value||'—'}%。财务覆盖率 ${fmt(selectedStock?.fundamental_coverage,0)}%；结果只作区间观察，不是目标价。`};updateValuationRange();document.querySelectorAll('.valuation-form input').forEach(i=>i.addEventListener('input',()=>setTimeout(updateValuationRange,0)))}const valuationStyle=document.createElement('style');valuationStyle.textContent='.valuation-assumption-note{grid-column:1/-1;padding:8px;background:var(--panel2);line-height:1.6}';document.head.appendChild(valuationStyle)
@@ -1785,6 +1788,10 @@ const newsValidationStyle=document.createElement('style');newsValidationStyle.te
     trade_plan_ui += concept_change_ui + news_validation_ui
     template = template.replace('</script></body></html>', trade_plan_ui + '</script></body></html>')
     OUT.mkdir(parents=True, exist_ok=True)
+    pattern_pool = build_pattern_pool(prices, stocks)
+    datasets['__PATTERN_ROWS__'] = pattern_pool['rows']
+    datasets['__PATTERN_META__'] = {k: v for k, v in pattern_pool.items() if k != 'rows'}
+    (OUT / "pattern_pool.json").write_text(json.dumps(pattern_pool, ensure_ascii=False, allow_nan=False, separators=(",", ":")), encoding="utf-8")
     history_out = OUT / "history"
     history_out.mkdir(exist_ok=True)
     for stale in history_out.glob("*.json"):
@@ -1805,8 +1812,9 @@ const newsValidationStyle=document.createElement('style');newsValidationStyle.te
     (OUT / "market_context.json").write_text(json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8")
     vendor = OUT / "vendor"
     vendor.mkdir(exist_ok=True)
-    for name in ["echarts.min.js", "tabulator.min.js", "tabulator_midnight.min.css", "review.js"]:
+    for name in ["echarts.min.js", "tabulator.min.js", "tabulator_midnight.min.css", "review.js", "pattern-watchlist.js"]:
         (vendor / name).write_bytes((SOURCE_VENDOR / name).read_bytes())
+    template = package_dashboard(template, datasets, OUT, SOURCE_VENDOR)
     (OUT / "index.html").write_text(template, encoding="utf-8")
     print(OUT / "index.html")
 

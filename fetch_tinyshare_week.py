@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 from tushare_proxy import create_pro
+from market_calendar import trading_dates, validate_daily
 
 
 OUT = Path("data")
@@ -20,6 +21,8 @@ def fetch(pro, api_name, filename, **kwargs):
                 print(f"EMPTY {api_name}: keep previous snapshot at {path}")
                 return {"api": api_name, "rows": 0, "file": str(path), "error": "empty response; previous snapshot kept"}
             raise ValueError("empty response and no previous snapshot")
+        if api_name == 'daily':
+            validate_daily(df, kwargs['trade_date'])
         df.to_csv(path, index=False, encoding="utf-8-sig")
         print(f"OK {api_name}: {len(df):,} rows -> {path}")
         return {"api": api_name, "rows": len(df), "file": str(path), "error": None}
@@ -133,9 +136,14 @@ def main():
     manifest = []
 
     end_date = date.today()
-    cal = pro.trade_cal(exchange="SSE", start_date=(end_date - timedelta(days=120)).strftime("%Y%m%d"), end_date=end_date.strftime("%Y%m%d"))
-    all_dates = sorted(cal.loc[cal["is_open"] == 1, "cal_date"].astype(str).tolist())
-    history_dates = all_dates[-60:]
+    try:
+        history_dates = trading_dates(pro, end_date)
+    except RuntimeError as exc:
+        (OUT / 'manifest.json').write_text(json.dumps({
+            'end_date': None,
+            'results': [{'api': 'daily', 'rows': 0, 'error': str(exc)}]
+        }, ensure_ascii=False, indent=2), encoding='utf-8')
+        raise
     dates = history_dates[-5:]
     start_date, end_date = dates[0], dates[-1]
     print("K-line window:", history_dates[0], history_dates[-1])
@@ -150,7 +158,7 @@ def main():
         fields="ts_code,name,management,market,fund_type,list_date,benchmark,invest_type,type,issue_amount"
     ))
 
-    for trade_date in history_dates:
+    for trade_date in reversed(history_dates):
         if trade_date not in dates:
             continue
         for api_name, prefix, fields in [
