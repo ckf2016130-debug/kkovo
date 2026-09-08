@@ -92,7 +92,7 @@ jobs:
       - name: Build dashboard
         # Pure signal checks run before generating a new published observation pool.
         run: |
-          python -m unittest test_pattern_watchlist.py
+          python -m unittest test_pattern_watchlist.py test_dashboard_delivery.py
           python build_market_dashboard.py
 
       - name: Save successful data snapshot

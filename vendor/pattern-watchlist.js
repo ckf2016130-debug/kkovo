@@ -28,8 +28,14 @@
   async function load(){
     $('pvFreshness').textContent='正在读取观察池…';
     try{
-      const response=await fetch('pattern_pool.json',{cache:'no-cache'});if(!response.ok)throw Error('http');
-      const data=await response.json();if(!Array.isArray(data.rows)||!data.params)throw Error('schema');
+      let data;
+      if(window.__MARKET_DATA__?.__PATTERN_META__){
+        data={...window.__MARKET_DATA__.__PATTERN_META__,rows:window.__MARKET_DATA__.__PATTERN_ROWS__};
+      }else{
+        const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),20000);
+        try{const response=await fetch('pattern_pool.json',{cache:'no-cache',signal:controller.signal});if(!response.ok)throw Error('http');data=await response.json();}finally{clearTimeout(timer)}
+      }
+      if(!Array.isArray(data.rows)||!data.params)throw Error('schema');
       payload=data;
       const age=data.as_of?Math.floor((Date.now()-Date.parse(date(data.as_of)+'T15:00:00+08:00'))/86400000):null;
       $('pvFreshness').style.color=age>3?'var(--gold)':'var(--muted)';
