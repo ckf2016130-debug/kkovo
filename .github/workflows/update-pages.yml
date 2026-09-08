@@ -15,6 +15,10 @@ on:
         description: Fetch and validate free history without publishing
         type: boolean
         default: false
+      restore_run:
+        description: Optional prior free data artifact run for resuming a backfill
+        type: string
+        default: ''
   push:
     branches: [main, master]
 
@@ -23,6 +27,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
   pages: write
   id-token: write
@@ -31,7 +36,7 @@ jobs:
   collect:
     if: github.event_name == 'workflow_dispatch' && inputs.collect_only
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -42,6 +47,13 @@ jobs:
           path: data
           key: dashboard-data-${{ github.run_id }}
           restore-keys: dashboard-data-
+      - uses: actions/download-artifact@v4
+        if: inputs.restore_run != ''
+        with:
+          name: free-market-data
+          path: data
+          run-id: ${{ inputs.restore_run }}
+          github-token: ${{ github.token }}
       - run: python -u fetch_free_market.py
       - uses: actions/upload-artifact@v4
         if: always()
