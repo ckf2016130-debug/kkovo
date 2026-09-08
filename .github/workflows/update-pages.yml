@@ -51,7 +51,7 @@ jobs:
         run: timeout 240s python fetch_tinyshare_week.py || echo "Market source timeout or authorization lock; previous snapshot will be used"
 
       - name: Fetch free intraday snapshot
-        run: timeout 120s python fetch_intraday_free.py || echo "Free intraday source failed; previous snapshot will be used"
+        run: timeout 180s python fetch_intraday_free.py || echo "Free market source failed; previous snapshot will be used"
 
       - name: Fetch concept and ETF intelligence
         env:
