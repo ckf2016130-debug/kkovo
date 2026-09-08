@@ -53,6 +53,8 @@ class FreeMarketTests(unittest.TestCase):
     def test_star_share_volume_converts_to_lots(self):
         body={'data':{'sh688981':{'qfqday':[['2026-09-08','100','101','102','99','27764164']]}}}
         self.assertEqual(parse_history(body,'sh688981','20260908')[0][5],277641.64)
+        body={'data':{'sh689009':{'qfqday':[['2026-09-08','40','40','41','39','8979553']]}}}
+        self.assertEqual(parse_history(body,'sh689009','20260908')[0][5],89795.53)
 
     def test_incomplete_manifest_refuses_full_publish(self):
         with tempfile.TemporaryDirectory() as tmp:

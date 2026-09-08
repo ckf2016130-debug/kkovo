@@ -99,7 +99,7 @@ def parse_quote(values, sym):
     if row['close'] is None or row['close'] <= 0 or row['vol'] is None:
         raise ValueError('Invalid quote')
     row['closed'] = stamp.hour >= 15
-    if sym.startswith('sh688'):
+    if sym.startswith(('sh688', 'sh689')):
         row['vol'] /= 100  # Tencent STAR raw feed is shares; storage/display is lots.
     return row
 
@@ -131,7 +131,7 @@ def parse_history(body, sym, cutoff):
         if len(values) != 5 or any(v is None for v in values):
             raise ValueError('Non-numeric OHLCV')
         op, close, high, low, vol = values
-        if sym.startswith('sh688'):
+        if sym.startswith(('sh688', 'sh689')):
             vol /= 100
         if day in seen or vol < 0 or low <= 0 or not low <= min(op, close) <= max(op, close) <= high:
             raise ValueError('Invalid OHLCV or duplicate date')
@@ -239,6 +239,8 @@ def main():
     def one(code):
         path = OUT / 'history' / f'{code}.json'
         old = read_json(path, {})
+        if code.startswith('689') and old.get('volume_schema') != 2:
+            old = {}  # Refresh the old CDR cache which used the feed's share units.
         quote = snapshot.get(code, {})
         if old.get('basis') == 'qfq' and old.get('checked_session') == cutoff and old.get('rows') and (
             quote.get('trade_date') != cutoff or not quote.get('closed') or
@@ -251,7 +253,7 @@ def main():
         if quote.get('trade_date') == cutoff and quote.get('closed') and quote.get('vol', 0) > 0:
             if rows[-1][0] != cutoff or abs(rows[-1][4] - quote['close']) > 0.011:
                 raise ValueError('History disagrees with completed quote')
-        result = dict(ts_code=code, source='腾讯公开行情', basis='qfq', volume_unit='手',
+        result = dict(ts_code=code, source='腾讯公开行情', basis='qfq', volume_unit='手', volume_schema=2,
                       checked_session=cutoff, retrieved_at=datetime.now(TZ).isoformat(), rows=rows)
         write_json(path, result)
         return code, result, 'fetched'
