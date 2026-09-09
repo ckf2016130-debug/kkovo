@@ -2,28 +2,72 @@ name: Update A-share Dashboard
 
 on:
   schedule:
-    # 15:35 and 17:10 Beijing time on trading weekdays; daily data is only complete after close.
-    - cron: "35 7 * * 1-5"
+    # 17:10 and 19:10 Beijing time: use completed, source-dated close snapshots.
     - cron: "10 9 * * 1-5"
+    - cron: "10 11 * * 1-5"
   workflow_dispatch:
     inputs:
       diagnose_only:
         description: Read-only market source diagnostics without publishing
         type: boolean
         default: false
+      collect_only:
+        description: Fetch and validate free history without publishing
+        type: boolean
+        default: false
+      restore_run:
+        description: Optional prior free data artifact run for resuming a backfill
+        type: string
+        default: ''
   push:
     branches: [main, master]
 
 concurrency:
-  group: dashboard-update-${{ inputs.diagnose_only && 'diagnose' || 'publish' }}
+  group: dashboard-update-${{ inputs.diagnose_only && 'diagnose' || inputs.collect_only && 'collect' || 'publish' }}
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
   pages: write
   id-token: write
 
 jobs:
+  collect:
+    if: github.event_name == 'workflow_dispatch' && inputs.collect_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: dashboard-data-${{ github.run_id }}
+          restore-keys: dashboard-data-
+      - uses: actions/download-artifact@v4
+        if: inputs.restore_run != ''
+        with:
+          name: free-market-data
+          path: data
+          run-id: ${{ inputs.restore_run }}
+          github-token: ${{ github.token }}
+      - run: python -u fetch_free_market.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: free-market-data
+          path: |
+            data/free
+            data/stock_basic.csv
+      - uses: actions/cache/save@v4
+        if: success()
+        with:
+          path: data
+          key: dashboard-data-${{ github.run_id }}
+
   diagnose:
     if: github.event_name == 'workflow_dispatch' && inputs.diagnose_only
     runs-on: ubuntu-latest
@@ -33,17 +77,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install pandas tushare
       - name: Probe source schemas and dates
-        env:
-          TUSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
-          TUSHARE_API_URL: https://fastapic.stockai888.top
-        run: timeout 180s python -u diagnose_market_source.py
+        run: timeout 180s python -u diagnose_free_market.py
 
   build-and-deploy:
-    if: ${{ !inputs.diagnose_only }}
+    if: ${{ !inputs.diagnose_only && !inputs.collect_only }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 90
     environment:
       name: github-pages
 
@@ -63,59 +103,36 @@ jobs:
           key: dashboard-data-${{ github.run_id }}
           restore-keys: dashboard-data-
 
+      - name: Bootstrap verified free history when the main-branch cache is empty
+        # Feature-branch caches cannot be restored by main. The verified artifact
+        # bridges that first deployment; later runs use the normal data cache.
+        if: hashFiles('data/free/manifest.json') == ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: free-market-data
+          path: data
+          run-id: ${{ inputs.restore_run || '34242894861' }}
+          github-token: ${{ github.token }}
+
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt --extra-index-url https://minidoc.pages.dev/simple/
+        run: python -m pip install pandas numpy requests akshare beautifulsoup4
 
-      - name: Fetch market data
-        env:
-          TUSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
-          TUSHARE_API_URL: https://fastapic.stockai888.top
-        run: timeout 240s python fetch_tinyshare_week.py || echo "::warning::Market refresh failed; inspect source errors above. Previous snapshot retained."
+      - name: Verify free data handling
+        run: python -m unittest test_pattern_watchlist.py test_dashboard_delivery.py test_market_source.py test_free_market.py
 
-      - name: Fetch free intraday snapshot
-        run: timeout 180s python fetch_intraday_free.py || echo "Free market source failed; previous snapshot will be used"
+      - name: Refresh free stock-name discovery
+        # This feed discovers securities only. Dates/prices come from verified histories.
+        run: timeout 120s python fetch_intraday_free.py || echo "::warning::Symbol discovery failed; using known universe"
 
-      - name: Fetch concept and ETF intelligence
-        env:
-          TUSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
-          TUSHARE_API_URL: https://fastapic.stockai888.top
-        run: timeout 240s python fetch_tinyshare_intelligence.py || echo "Concept or ETF intelligence timeout/permission failure; available snapshots will be used"
+      - name: Refresh free daily data and backfill missing histories
+        run: python -u fetch_free_market.py
 
-      - name: Ensure K-line history window
-        env:
-          TUSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
-          TUSHARE_API_URL: https://fastapic.stockai888.top
-        run: timeout 240s python fetch_tinyshare_history.py || echo "K-line history source timeout; previous history snapshot will be used"
-
-      - name: Fetch overseas market data
-        run: timeout 180s python fetch_overseas.py || echo "Overseas source timeout or failure; previous snapshot will be used"
-
-      - name: Build rotation and fundamental metrics
-        run: timeout 180s python build_rotation_report.py
-
-      - name: Fetch fundamental data
-        env:
-          TUSHARE_TOKEN: ${{ secrets.TINYSHARE_TOKEN }}
-          TUSHARE_API_URL: https://fastapic.stockai888.top
-        run: timeout 240s python fetch_tinyshare_fundamentals.py || echo "Fundamental source timeout or authorization lock; previous snapshot will be used"
-
-      - name: Fetch and score news
-        run: timeout 180s python fetch_score_news.py || echo "News source timeout or failure; previous snapshot will be used"
-
-      - name: Validate market data freshness
-        env:
-          MAX_MARKET_DATA_AGE_DAYS: "10"
-          MIN_DAILY_ROWS: "100"
-          # UI-only releases may deploy with the last snapshot. The page exposes
-          # the actual market cutoff and marks stale data instead of presenting it as live.
-          ALLOW_STALE_DEPLOY: "1"
-        run: python validate_market_data.py
+      - name: Preserve dated historical reference
+        run: timeout 240s python build_historical_archive.py || echo "::warning::Historical archive unavailable; latest free dashboard continues"
 
       - name: Build dashboard
-        # Pure signal checks run before generating a new published observation pool.
-        run: |
-          python -m unittest test_pattern_watchlist.py test_dashboard_delivery.py test_market_source.py
-          python build_market_dashboard.py
+        run: python build_free_dashboard.py
 
       - name: Save successful data snapshot
         if: success()
