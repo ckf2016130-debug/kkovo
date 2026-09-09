@@ -570,7 +570,12 @@ def build():
             mf = pd.read_csv(path)
             mf["net_mf_amount"] = pd.to_numeric(mf["net_mf_amount"], errors="coerce")
             merged = mf.merge(stock_class, on="ts_code", how="inner").dropna(subset=["net_mf_amount"])
-            for col in ["buy_sm_amount", "sell_sm_amount", "buy_md_amount", "sell_md_amount", "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount"]:
+            breakdown_columns = ["buy_sm_amount", "sell_sm_amount", "buy_md_amount", "sell_md_amount", "buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount"]
+            if not set(breakdown_columns).issubset(mf.columns):
+                # The free ranking exposes verified main-flow net amount but not gross
+                # order-size buckets. Do not manufacture institution/retail proxies.
+                continue
+            for col in breakdown_columns:
                 merged[col] = pd.to_numeric(merged.get(col), errors="coerce").fillna(0)
             merged["small_mid_net"] = merged["buy_sm_amount"] - merged["sell_sm_amount"] + merged["buy_md_amount"] - merged["sell_md_amount"]
             merged["large_net"] = merged["buy_lg_amount"] - merged["sell_lg_amount"]
@@ -1520,16 +1525,38 @@ def build():
         change_history_path.write_text(json.dumps(change_history, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         pass
+    price_dates = sorted({str(x["trade_date"]) for x in prices})
+    flow_dates = sorted({str(x["trade_date"]) for x in flows if x.get("trade_date")})
+    latest_price_cutoff = price_dates[-1] if price_dates else None
+    latest_flow_cutoff = flow_dates[-1] if flow_dates else None
+    flow_lag_days = None
+    if latest_price_cutoff and latest_flow_cutoff:
+        try:
+            flow_lag_days = max(0, (pd.to_datetime(latest_price_cutoff) - pd.to_datetime(latest_flow_cutoff)).days)
+        except (TypeError, ValueError):
+            flow_lag_days = None
+    flow_is_stale = flow_lag_days is None or flow_lag_days > 3
+    if flow_is_stale:
+        conclusion = f"价格数据已更新至 {latest_price_cutoff or '未知'}，但主力资金仅到 {latest_flow_cutoff or '不可用'}；当前板块资金排名只能作历史背景，不能当作今日资金方向。"
+        main_conflict = "价格与资金数据日期未对齐；在资金恢复前，只使用价格、成交额和涨跌家数观察市场"
+        reason_blocks["secondary"] = f"资金限制：主力资金截止 {latest_flow_cutoff or '不可用'}，落后价格 {flow_lag_days if flow_lag_days is not None else '未知'} 天。"
+        reason_blocks["reverse"] = "恢复同日资金数据后，必须重新计算板块排名、主线判断和候选股顺序。"
+
     summary = {
         "stock_count": len(stocks),
         "sector_count": len(sectors),
         "mean_ret": mean_ret if not numeric_stocks.empty else None,
         "breadth": float((numeric_stocks > 0).mean() * 100) if not numeric_stocks.empty else None,
         "total_flow": float(pd.to_numeric(pd.Series([x.get("net_mf_5d_yi") for x in stocks]), errors="coerce").sum(min_count=1)),
-        "price_dates": sorted({str(x["trade_date"]) for x in prices}),
+        "price_dates": price_dates,
+        "flow_dates": flow_dates,
+        "latest_price_cutoff": latest_price_cutoff,
+        "latest_flow_cutoff": latest_flow_cutoff,
+        "flow_lag_days": flow_lag_days,
+        "flow_is_stale": flow_is_stale,
         "generated_at": generated_at,
-        "source": "TinyShare授权接口 + 本地消息快照",
-        "freshness": "按最近成功抓取批次生成；非实时",
+        "source": "AKShare免费行情 + TinyShare历史资金 + 本地消息快照",
+        "freshness": "价格与资金分别按最近成功批次生成；非实时",
         "intraday": intraday,
         "estimated": True,
         "sentiment_score": sentiment,
@@ -1561,10 +1588,10 @@ def build():
         "trade_sector_score": trade_sector.get("trade_value_score"),
         "trade_sector_reason": f"交易价值 {float(trade_sector.get('trade_value_score') or 0):.1f}/100：{trade_sector.get('trade_value_reason', '优先观察有资金承接且上涨宽度较好的方向')}；仍需下一交易日验证",
         "trade_plan": trade_plan,
-        "position": round(min(80, max(20, money_effect * 0.7)), 0),
-        "confidence": "中",
-        "validation": f"验证点：观察 {lead_in or '最强承接方向'} 次日是否继续净流入，并确认龙头、中军与板块同步。",
-        "invalidation": "失效条件：资金广度转负、最强板块跌破前一交易日低点，或利好方向出现放量冲高回落。",
+        "position": min(20, round(min(80, max(20, money_effect * 0.7)), 0)) if flow_is_stale else round(min(80, max(20, money_effect * 0.7)), 0),
+        "confidence": "低" if flow_is_stale else "中",
+        "validation": f"验证点：先恢复并核对 {latest_price_cutoff or '最新价格日'} 同日资金，再观察 {lead_in or '最强承接方向'} 是否获得价格与资金共振。" if flow_is_stale else f"验证点：观察 {lead_in or '最强承接方向'} 次日是否继续净流入，并确认龙头、中军与板块同步。",
+        "invalidation": "当前资金日期落后，所有依赖主力资金的主线、轮动和仓位结论暂不成立。" if flow_is_stale else "失效条件：资金广度转负、最强板块跌破前一交易日低点，或利好方向出现放量冲高回落。",
         "news_briefs": news_briefs,
         "logic_chain": logic_chain,
         "market_flow_series": market_flow_series,

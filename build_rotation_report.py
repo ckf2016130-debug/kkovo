@@ -1,5 +1,6 @@
 import html
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,9 @@ import pandas as pd
 DATA = Path("data")
 OUT = Path("output")
 DATES = []
+FLOW_DATES = []
+LIMIT_DATES = []
+VALUATION_DATE = None
 
 
 def num(s):
@@ -34,13 +38,34 @@ def usable_csv(path):
         return False
 
 
+def usable_valuation(path):
+    try:
+        frame = pd.read_csv(path)
+        fields = [c for c in ["turnover_rate", "total_mv", "circ_mv", "pe", "pb"] if c in frame]
+        return len(frame) >= 100 and bool(fields) and int(frame[fields].notna().sum().max()) >= 100
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+        return False
+
+
 def load():
-    global DATES
-    candidates = sorted(path.stem.split("_")[-1] for path in DATA.glob("daily_*.csv") if path.stem.split("_")[-1].isdigit())
-    valid_dates = [d for d in candidates if all(usable_csv(DATA / f"{prefix}_{d}.csv") for prefix in ["daily", "daily_basic", "moneyflow", "limit_list"])]
-    DATES = valid_dates[-5:]
+    global DATES, FLOW_DATES, LIMIT_DATES, VALUATION_DATE
+    candidates = sorted(
+        match.group(1)
+        for path in DATA.glob("daily_*.csv")
+        if (match := re.fullmatch(r"daily_(\d{8})\.csv", path.name))
+    )
+    price_dates = [d for d in candidates if usable_csv(DATA / f"daily_{d}.csv")]
+    valuation_dates = [d for d in candidates if usable_valuation(DATA / f"daily_basic_{d}.csv")]
+    FLOW_DATES = sorted(path.stem.split("_")[-1] for path in DATA.glob("moneyflow_*.csv") if path.stem.split("_")[-1].isdigit() and usable_csv(path))[-5:]
+    LIMIT_DATES = sorted(path.stem.split("_")[-1] for path in DATA.glob("limit_list_*.csv") if path.stem.split("_")[-1].isdigit() and usable_csv(path))[-5:]
+    DATES = price_dates[-5:]
     if len(DATES) < 2:
-        raise RuntimeError("可用交易日数据不足，至少需要两个交易日")
+        raise RuntimeError("可用价格交易日不足，至少需要两个交易日")
+    if not FLOW_DATES:
+        raise RuntimeError("没有可验证的主力资金快照；拒绝用价格反推或伪造资金")
+    if not valuation_dates:
+        raise RuntimeError("没有覆盖合格的估值快照")
+    VALUATION_DATE = valuation_dates[-1]
     basic = pd.read_csv(DATA / "stock_basic.csv", dtype={"symbol": str, "list_date": str})
     basic["industry"] = basic["industry"].fillna("未分类").replace("", "未分类")
     d0 = pd.read_csv(DATA / f"daily_{DATES[0]}.csv")
@@ -51,22 +76,26 @@ def load():
     week["week_ret"] = (num(week["close"]) / num(week["pre_close"]) - 1) * 100
     week["fri_ret"] = num(week["pct_chg"])
 
-    valuation = pd.read_csv(DATA / f"daily_basic_{DATES[-1]}.csv")
+    valuation = pd.read_csv(DATA / f"daily_basic_{VALUATION_DATE}.csv")
     for c in ["turnover_rate", "total_mv", "circ_mv", "pe", "pb"]:
         valuation[c] = num(valuation[c])
 
     flows = []
-    for date in DATES:
+    for date in FLOW_DATES:
         x = pd.read_csv(DATA / f"moneyflow_{date}.csv")
         x["trade_date"] = x["trade_date"].astype(str)
         x["net_mf_amount"] = num(x["net_mf_amount"])
         flows.append(x[["ts_code", "trade_date", "net_mf_amount"]])
     flow = pd.concat(flows, ignore_index=True)
     flow_w = flow.groupby("ts_code", as_index=False)["net_mf_amount"].sum().rename(columns={"net_mf_amount": "net_mf_5d"})
-    fri_flow = flow[flow["trade_date"] == DATES[-1]][["ts_code", "net_mf_amount"]].rename(columns={"net_mf_amount": "net_mf_fri"})
+    fri_flow = flow[flow["trade_date"] == FLOW_DATES[-1]][["ts_code", "net_mf_amount"]].rename(columns={"net_mf_amount": "net_mf_fri"})
 
-    limits = pd.concat([pd.read_csv(DATA / f"limit_list_{d}.csv") for d in DATES], ignore_index=True)
-    lim_counts = limits.pivot_table(index="ts_code", columns="limit", values="trade_date", aggfunc="count", fill_value=0).reset_index()
+    if LIMIT_DATES:
+        limits = pd.concat([pd.read_csv(DATA / f"limit_list_{d}.csv") for d in LIMIT_DATES], ignore_index=True)
+        lim_counts = limits.pivot_table(index="ts_code", columns="limit", values="trade_date", aggfunc="count", fill_value=0).reset_index()
+    else:
+        limits = pd.DataFrame(columns=["ts_code", "trade_date", "limit"])
+        lim_counts = pd.DataFrame({"ts_code": basic["ts_code"]})
     for c in ["U", "D", "Z"]:
         if c not in lim_counts:
             lim_counts[c] = 0
@@ -94,7 +123,7 @@ def analyze(stocks, flow, limits):
     daily_flow = flow.merge(stocks[["ts_code", "industry"]], on="ts_code", how="left")
     daily_sector = daily_flow.groupby(["industry", "trade_date"], as_index=False)["net_mf_amount"].sum()
     daily_sector["net_mf_yi"] = daily_sector["net_mf_amount"] / 10000
-    fri = daily_sector[daily_sector["trade_date"] == DATES[-1]][["industry", "net_mf_yi"]].rename(columns={"net_mf_yi": "fri_flow_yi"})
+    fri = daily_sector[daily_sector["trade_date"] == FLOW_DATES[-1]][["industry", "net_mf_yi"]].rename(columns={"net_mf_yi": "fri_flow_yi"})
 
     sec = valid.groupby("industry").agg(
         constituents=("ts_code", "count"),
@@ -196,7 +225,8 @@ def make_html(stocks, sec, daily_sector, limits):
           <details><summary>展开全部 {len(rows)} 只成分股</summary>{all_constituents(rows)}</details>
         </section>""")
 
-    source_note = f"TinyShare/Tushare兼容接口：stock_basic、daily、daily_basic、moneyflow、limit_list_d、trade_cal、moneyflow_hsgt、margin；数据窗口为{DATES[0]}至{DATES[-1]}。"
+    limit_window = f"{LIMIT_DATES[0]}至{LIMIT_DATES[-1]}" if LIMIT_DATES else "不可用"
+    source_note = f"价格窗口：{DATES[0]}至{DATES[-1]}（TinyShare或AKShare免费收盘快照）；估值截止：{VALUATION_DATE}；主力资金窗口：{FLOW_DATES[0]}至{FLOW_DATES[-1]}（TinyShare或AKShare东方财富成交拆单口径）；涨跌停窗口：{limit_window}。不同口径分别标注，不把旧数据冒充当日数据。"
     html_text = f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
     <title>A股资金流与板块轮动周报</title><style>
     :root{{--bg:#f4f6f8;--paper:#fff;--ink:#17202a;--muted:#68727d;--line:#dfe4e8;--red:#c0392b;--green:#16794b;--gold:#b78103;--blue:#275d88}}
